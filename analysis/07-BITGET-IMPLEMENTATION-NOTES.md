@@ -1,6 +1,36 @@
 # 07 — Bitget V2 implementation notes (concrete payloads)
 
-> ⚠ **UNVERIFIED — confirm with `bitget_api_probe.py` (see 06 §9) before writing order code.**
+## 0. ✅ VERIFIED REALITY (probe run 2026-08-17, `scripts/bitget_api_probe.py`, GREEN=9 RED=0)
+
+**This section SUPERSEDES every conflicting claim below it.** Everything here came from a live
+response on this machine's IP. Sections 1–9 are kept for provenance; where they disagree with
+this section, they are WRONG and are annotated `❌ SUPERSEDED`.
+
+| # (§8 question) | Verdict | VERIFIED fact |
+|---|---|---|
+| 1. testnet / product | ✅ | `productType=umcbl` is **DEAD** (`code 40034 Parameter umcbl does not exist`). Live set: `USDT-FUTURES`, `COIN-FUTURES`, `USDC-FUTURES`, **`SUSDT-FUTURES`**, `SCOIN-FUTURES`, `SUSDC-FUTURES`. `SUSDT-FUTURES` is the **demo/testnet product on the same host** (`SBTCSUSDT` etc.) → that is our testnet-first path, no separate hostname. |
+| 2. spec field names | ✅ | Doc's `minSize`/`maxSize`/`sizeIncrement`/`priceIncrement` **do not exist**. Real: `minTradeNum`, `sizeMultiplier`, `pricePlace` (decimals), `volumePlace` (decimals), `minTradeUSDT`, `makerFeeRate`, `takerFeeRate`, `symbolStatus`. |
+| 3. side enum | ⚠ | V2 mix uses `side=buy\|sell` **plus** `tradeSide=open\|close` (hedge mode); one-way mode omits `tradeSide` and closes via `reduceOnly`. Doc's `open_long`/`close_short` is **V1 legacy**. Not provable without placing an order → adapter uses one-way + `reduceOnly`, unit-tested; needs a demo key to close out. |
+| 4. preset TP/SL | ⚠ | `presetStopSurplusPrice` / `presetStopLossPrice` on `/order/place-order`; separate `/order/place-tpsl-order` for post-open protective orders. Requires a key to confirm end-to-end. |
+| 5. dead-man switch | ⚠ | No documented `set-auto-cancel` for V2 mix → dead-man's switch is implemented **client-side** (watchdog → `cancel-all` of non-protective orders + flatten). |
+| 6. fee field | ✅ | Fee **rates** are on the contract: `makerFeeRate=0.0002`, `takerFeeRate=0.0006` (VIP0), matching the assumption. Per-fill field is `fee` on `/order/fills` and is reported **NEGATIVE**; adapter normalizes to a positive cost. |
+| 7. geo-block | ✅ | **No geo-block from this IP.** `HTTP 200 code=00000`. No Cloudflare Worker proxy needed (unlike MEXC). |
+
+### Corrected endpoints / transport (all VERIFIED)
+- REST base `https://api.bitget.com`, **`productType=USDT-FUTURES`**.
+- Contracts: `GET /api/v2/mix/market/contracts?productType=USDT-FUTURES[&symbol=BTCUSDT]` (754 symbols).
+- Ticker: `GET /api/v2/mix/market/ticker` — **SINGULAR**, not `/tickers`. Has `lastPr`, `indexPrice`, `markPrice`, `fundingRate`.
+- Private account path: `GET /api/v2/mix/account/accounts` — **PLURAL** (`40006 Invalid ACCESS_KEY` when unsigned ⇒ path is real).
+- Auth headers are **`ACCESS-KEY` / `ACCESS-SIGN` / `ACCESS-TIMESTAMP` / `ACCESS-PASSPHRASE`** (doc §2's `ACcess-Key` was a typo). Server confirmed it reads them (`40006`/`40037`, not `404`).
+- **Passphrase is sent RAW**, *not* `base64(hmac(secret, passphrase))` — doc §2's pre-signing is the OKX variant and is WRONG for Bitget.
+- **WS host `wss://ws.bitget.com/mix/v1/stream` is DEAD (HTTP 404).** Real: **`wss://ws.bitget.com/v2/ws/public`** and `/v2/ws/private`.
+- WS `args` are **objects** `{"instType":"USDT-FUTURES","channel":"ticker","instId":"BTCUSDT"}` — NOT doc §5's `"tickers.BTCUSDT"` strings. Channel name is `ticker`, singular.
+- WS heartbeat: **client sends the literal string `ping`, server replies literal `pong`** (plain text, not JSON).
+- Sizing is in **BASE COIN**, not contracts (`PEPEUSDT: minTradeNum=1000, sizeMultiplier=1000, volumePlace=0`). 1000x-prefixed contracts DO exist: `1000BONKUSDT`, `1000SATSUSDT`, `1000000MOGUSDT`, `10000NEXUSDT`, etc. — so a plain `PEPEUSDT` *and* `1000BONKUSDT` style coexist and the SymbolMap must not assume a `1000` prefix.
+
+---
+
+> ⚠ **ORIGINAL UNVERIFIED ANALYSIS BELOW — superseded by §0 where they conflict.**
 > Web docs were unreachable during this analysis. The V2 signing model and endpoint *shapes*
 > below follow the documented Bitget V2 convention; exact query-string parameters, JSON field
 > names, and WS channel strings must be validated against a live response and then pinned in this
