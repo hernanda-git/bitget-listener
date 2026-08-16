@@ -27,15 +27,17 @@ sibling-repos/
 src/  tests/  scripts/  docs/   # <-- the bot is built here by the autonomous agent
 ```
 
-## On the other machine
-```bash
-git clone https://github.com/hernanda-git/bitget-listener
-cd bitget-listener
-bash run-autonomous.sh
-```
-The script extracts the sibling repos, ensures Python 3.11+ and Hermes Agent CLI, and launches
-the autonomous build from `MASTER-PROMPT.md`. It will **not** place a real Bitget order — the bot
-is paper-by-default behind a go-live gate.
+## How to run it (other machine already has Hermes on Telegram)
+This repo is built to be **pasted, not scripted**. The other machine already runs Hermes wired
+to a Telegram bot channel — so:
+
+1. Open that Hermes Telegram channel.
+2. **Paste the entire contents of `MASTER-PROMPT.md`** into the chat.
+3. Hermes clones this repo, extracts the sibling repos, reads the analysis, and builds the bot
+   autonomously (paper-by-default; no real order without the go-live gate).
+
+`MASTER-PROMPT.md` is self-contained: it includes the clone/extract step, the reading order, the
+hard rules, the build sequence, and the definition of done. No shell bootstrap needed.
 
 ## Hard rules (see MASTER-PROMPT.md)
 Paper by default · verify Bitget V2 against a live probe before order code · never auto-cancel

@@ -1,8 +1,9 @@
 # AUDIT-PLAN — phased autonomous execution (self-healing loop)
 
-This mirrors the operator's standing preference for long multi-axis tasks: per-phase prompt
-files + an index/status checkpoint (⬜/✅), a recurring cadence that resumes from the checkpoint
-after a failure, and a lock file so concurrent ticks don't collide.
+This is the execution tracker for the agent running `MASTER-PROMPT.md` (pasted into the other
+machine's Hermes Telegram channel). It mirrors the operator's standing preference for long
+multi-axis tasks: per-phase checkpoint (⬜/✅), a lock file so concurrent ticks don't collide,
+and resume-from-checkpoint after any failure.
 
 ## Checkpoint index
 | Phase | Goal | Status | Verification |
