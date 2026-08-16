@@ -1,0 +1,27 @@
+# secrets / local state
+.env
+.env.*
+*.session
+sessions/
+__pycache__/
+*.pyc
+.venv/
+venv/
+# extracted sibling repos (regenerate from tarball if needed)
+learnernoearner-listener/
+mexc-listener/
+bybit-listener/
+hyperliquid-fatty-trader/
+# build artifacts
+__pycache__/
+*.egg-info/
+build/
+dist/
+# audit runtime
+.audit.lock
+BLOCKED.md
+*.db
+data/
+# OS
+.DS_Store
+Thumbs.db
