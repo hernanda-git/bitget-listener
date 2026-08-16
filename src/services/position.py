@@ -65,8 +65,11 @@ class PositionManager:
         pos = self.get(symbol)
         if pos is None:
             return {"status": "NO_POSITION", "symbol": symbol}
+        # Snapshot the size BEFORE closing: the adapter mutates position state, so
+        # reading pos.size afterwards would compute the remainder off the reduced size.
+        original_size = pos.size
         res = await self.orders.close_position(pos, fraction, reason="tp1_booked")
-        remaining = pos.size * (1 - min(1.0, max(0.0, fraction)))
+        remaining = original_size * (1 - min(1.0, max(0.0, fraction)))
         if remaining > 0:
             self.upsert(Position(**{**pos.__dict__, "size": remaining}))
         else:

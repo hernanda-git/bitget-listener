@@ -28,6 +28,7 @@ class RiskLimits:
     min_notional_usd: float = 5.0
     cooldown_s: int = 30
     whitelist_only: bool = True
+    equity_usd: float = 100.0   # denominator for the daily-loss kill switch
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,18 @@ class FixedRiskSizer(RiskPolicy):
         notional = min(notional_usd, self.limits.max_position_usd)
         lev = max(1, min(int(max_leverage), self.limits.max_leverage))
         return notional / mark_price, lev
+
+    def estimate_open_fee(self, qty: float, price: float,
+                          spec: InstrumentSpec | None = None) -> float:
+        """Taker fee for the opening leg. Never returns 0 for a real qty (BUG A)."""
+        rate = spec.taker_fee if spec is not None else 0.0006
+        return abs(qty) * abs(price) * rate
+
+    def estimate_close_fee(self, qty: float, price: float,
+                           spec: InstrumentSpec | None = None) -> float:
+        """Taker fee for the closing leg."""
+        rate = spec.taker_fee if spec is not None else 0.0006
+        return abs(qty) * abs(price) * rate
 
     def size_for_signal(self, entry: float, sl: float | None, spec: InstrumentSpec,
                         requested_leverage: int = 0,

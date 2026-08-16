@@ -61,7 +61,38 @@ class FakeExchangeAdapter(ExchangeAdapter):
             ts_ms=1, is_reduce=order.reduce_only, exec_type="normal",
             order_id=oid, symbol=order.instrument.symbol,
         ))
+        self._apply_to_position(order, price)
         return oid
+
+    def _apply_to_position(self, order: OrderRequest, price: float) -> None:
+        """Simulate venue position state so get_positions() reflects placed orders.
+
+        Without this the fake is unrealistically stateless and a bug where the bot
+        loses track of its own position would pass the suite.
+        """
+        symbol = order.instrument.symbol
+        existing = next((p for p in self.positions if p.instrument.symbol == symbol), None)
+        if order.reduce_only:
+            if existing is None:
+                return
+            existing.size = max(0.0, existing.size - order.qty)
+            if existing.size <= 1e-12:
+                self.positions.remove(existing)
+            return
+        if existing is None:
+            self.positions.append(Position(
+                instrument=order.instrument, side=order.side, size=order.qty,
+                entry_price=price, leverage=order.leverage, liq_price=54_000.0,
+                sl_price=order.sl, tp_price=order.tp, margin_mode=order.margin_mode))
+            return
+        total = existing.size + order.qty
+        existing.entry_price = ((existing.entry_price * existing.size)
+                                + (price * order.qty)) / total if total else price
+        existing.size = total
+        if order.sl is not None:
+            existing.sl_price = order.sl
+        if order.tp is not None:
+            existing.tp_price = order.tp
 
     async def place_protective(self, order: OrderRequest, plan_type: str = "loss_plan") -> str:
         self.open_orders.append({"orderId": f"prot-{len(self.open_orders)}",

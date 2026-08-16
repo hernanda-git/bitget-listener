@@ -87,7 +87,9 @@ class Notifier(abc.ABC):
     """Sends alerts + receives /commands."""
 
     @abc.abstractmethod
-    async def send(self, text: str) -> None: ...
+    async def send(self, text: str) -> bool:
+        """Deliver a message. Returns True when it was actually delivered."""
+        ...
 
 
 class RiskPolicy(abc.ABC):
