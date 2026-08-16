@@ -1,0 +1,481 @@
+"""BitgetAdapter — Bitget V2 mix (USDⓈ-M futures) REST adapter.
+
+Structure follows bybit-listener's ``BybitAdapter``; execution rigor (validate →
+deterministic repair → single resubmit, magnitude-flip guards) follows mexc-listener.
+
+**Every endpoint, parameter and field name here was VERIFIED by
+``scripts/bitget_api_probe.py``** — see `analysis/07-BITGET-IMPLEMENTATION-NOTES.md` §0.
+Notably the analysis doc's `umcbl`, `sizeIncrement`, `/market/tickers` and
+pre-hashed passphrase were all WRONG and are not used.
+
+Safety contracts implemented here:
+- BUG A: ``get_fills`` always carries the REAL ``fee`` (Bitget reports it negative;
+  normalized to a positive cost). A fill is never recorded with fee 0 silently.
+- BUG B: ``get_positions`` reads the REAL ``liquidationPrice``; it is never coerced to 0.0.
+- BUG C: ``cancel_all`` NEVER cancels ``reduceOnly`` protective orders.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import os
+import time
+import uuid
+
+from typing import Any
+
+import httpx
+
+from src.domain.model import (
+    Fill,
+    Instrument,
+    InstrumentSpec,
+    OrderRequest,
+    Position,
+    Side,
+)
+from src.exchanges.bitget_auth import BitgetAuth
+from src.interfaces.ports import ExchangeAdapter
+
+log = logging.getLogger(__name__)
+
+# VERIFIED V2 paths (see analysis/07 §0)
+P_CONTRACTS = "/api/v2/mix/market/contracts"
+P_TICKER = "/api/v2/mix/market/ticker"          # SINGULAR
+P_PLACE = "/api/v2/mix/order/place-order"
+P_TPSL = "/api/v2/mix/order/place-tpsl-order"
+P_CANCEL = "/api/v2/mix/order/cancel-order"
+P_OPEN_ORDERS = "/api/v2/mix/order/orders-pending"
+P_FILLS = "/api/v2/mix/order/fills"
+P_POSITIONS = "/api/v2/mix/position/all-position"
+P_ACCOUNTS = "/api/v2/mix/account/accounts"     # PLURAL
+P_SET_LEVERAGE = "/api/v2/mix/account/set-leverage"
+
+# Bitget business codes that are worth a deterministic repair rather than a hard fail
+REPAIRABLE_CODES = {
+    "40762",  # order size exceeds/below limit
+    "40774",  # size precision
+    "45110",  # less than the minimum amount
+    "43012",  # insufficient (size) — re-round then resubmit once
+    "40808",  # param verification exception
+}
+
+
+class BitgetError(RuntimeError):
+    """A Bitget business error (non-`00000` code)."""
+
+    def __init__(self, code: str, msg: str, path: str = "") -> None:
+        super().__init__(f"bitget {code} on {path}: {msg}")
+        self.code = code
+        self.msg = msg
+        self.path = path
+
+    @property
+    def repairable(self) -> bool:
+        return self.code in REPAIRABLE_CODES
+
+
+class BitgetAdapter(ExchangeAdapter):
+    """Bitget V2 mix adapter. All order paths funnel through ``_signed``."""
+
+    def __init__(self, key: str = "", secret: str = "", passphrase: str = "",
+                 product_type: str | None = None, base_url: str | None = None,
+                 margin_coin: str = "USDT", client: httpx.AsyncClient | None = None,
+                 paper: bool = True, recv_window_ms: int = 5000) -> None:
+        self.base_url = (base_url or os.getenv("BITGET_REST_BASE", "https://api.bitget.com")).rstrip("/")
+        self.product_type = product_type or os.getenv("BITGET_PRODUCT_TYPE", "SUSDT-FUTURES")
+        self.margin_coin = margin_coin if self.product_type == "USDT-FUTURES" else "SUSDT"
+        self.paper = paper
+        self.recv_window_ms = recv_window_ms
+        self._auth: BitgetAuth | None = None
+        if key and secret and passphrase:
+            self._auth = BitgetAuth(key, secret, passphrase)
+        self._client = client
+        self._owns_client = client is None
+        self._spec_cache: dict[str, InstrumentSpec] = {}
+
+    # ------------------------------------------------------------------ plumbing
+    @property
+    def is_demo(self) -> bool:
+        """True when pointed at Bitget's demo product (`SUSDT-FUTURES`)."""
+        return self.product_type.startswith("S")
+
+    async def _http(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=20)
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None and self._owns_client:
+            await self._client.aclose()
+            self._client = None
+
+    @staticmethod
+    def _qs(params: dict) -> str:
+        clean = {k: v for k, v in params.items() if v is not None}
+        if not clean:
+            return ""
+        return "?" + "&".join(f"{k}={v}" for k, v in clean.items())
+
+    async def _public(self, path: str, params: dict | None = None) -> Any:
+        client = await self._http()
+        r = await client.get(f"{self.base_url}{path}", params=params or {})
+        body = r.json()
+        if body.get("code") != "00000":
+            raise BitgetError(str(body.get("code")), str(body.get("msg")), path)
+        return body.get("data")
+
+    async def _signed(self, method: str, path: str, params: dict | None = None,
+                      body: dict | None = None) -> Any:
+        """Signed request. ``request_path`` includes the query string (VERIFIED)."""
+        if self._auth is None:
+            raise BitgetError("NO_CREDS",
+                              "no Bitget API credentials configured (set BITGET_API_KEY/"
+                              "SECRET/PASSPHRASE in .env)", path)
+        request_path = path + self._qs(params or {})
+        payload = json.dumps(body, separators=(",", ":")) if body else ""
+        headers = self._auth.headers(method, request_path, payload)
+        client = await self._http()
+        r = await client.request(method.upper(), f"{self.base_url}{request_path}",
+                                 content=payload or None, headers=headers)
+        try:
+            data = r.json()
+        except Exception:
+            raise BitgetError(str(r.status_code), r.text[:200], path)
+        if data.get("code") != "00000":
+            raise BitgetError(str(data.get("code")), str(data.get("msg")), path)
+        return data.get("data")
+
+    # ----------------------------------------------------------- instrument spec
+    @staticmethod
+    def _step_from_places(places: Any) -> float:
+        """Bitget publishes DECIMAL PLACES, not a step. `volumePlace=4` -> 0.0001."""
+        return 10 ** -int(places)
+
+    async def get_spec(self, instrument: Instrument) -> InstrumentSpec:
+        if instrument.symbol in self._spec_cache:
+            return self._spec_cache[instrument.symbol]
+        rows = await self._public(P_CONTRACTS, {"productType": self.product_type,
+                                                "symbol": instrument.symbol})
+        if not rows:
+            raise BitgetError("NO_SPEC", f"no contract for {instrument.symbol}", P_CONTRACTS)
+        spec = self._parse_spec(rows[0])
+        self._spec_cache[instrument.symbol] = spec
+        return spec
+
+    @classmethod
+    def _parse_spec(cls, row: dict) -> InstrumentSpec:
+        """Decode the VERIFIED contract shape into step sizes."""
+        return InstrumentSpec(
+            symbol=row["symbol"],
+            price_step=cls._step_from_places(row["pricePlace"]),
+            qty_step=cls._step_from_places(row["volumePlace"]),
+            min_qty=float(row["minTradeNum"]),
+            size_multiplier=float(row.get("sizeMultiplier") or row["minTradeNum"]),
+            min_notional=float(row.get("minTradeUSDT") or 5),
+            max_leverage=int(float(row.get("maxLever") or 20)),
+            maker_fee=float(row.get("makerFeeRate") or 0.0002),
+            taker_fee=float(row.get("takerFeeRate") or 0.0006),
+        )
+
+    # ------------------------------------------------------------------ rounding
+    @staticmethod
+    def _floor_step(value: float, step: float) -> float:
+        if step <= 0:
+            return value
+        # round() guards binary FP so 0.29/0.01 doesn't collapse to 0.28
+        return math.floor(round(value / step, 9)) * step
+
+    @classmethod
+    def round_price(cls, spec: InstrumentSpec, price: float) -> float:
+        """Step price DOWN to the tick, with a magnitude-flip guard (MEXC Edge C).
+
+        A $0.16 coin must never come back as $100: if rounding changes the order of
+        magnitude, the original price is returned untouched for the validator to reject.
+        """
+        if price is None or price <= 0:
+            return price
+        rounded = cls._floor_step(price, spec.price_step)
+        if rounded <= 0:
+            return price
+        if abs(math.log10(rounded / price)) > 0.5:   # magnitude flip -> refuse
+            log.error("round_price magnitude flip %s: %s -> %s", spec.symbol, price, rounded)
+            return price
+        return round(rounded, 12)
+
+    @classmethod
+    def round_qty(cls, spec: InstrumentSpec, qty: float, price_ref: float | None = None) -> float:
+        """Step qty to the size multiplier, satisfy min qty and min notional."""
+        step = max(spec.qty_step, spec.size_multiplier)
+        q = cls._floor_step(qty, step)
+        if q < spec.min_qty:
+            q = spec.min_qty
+        if price_ref and price_ref > 0:
+            guard = 0
+            while q * price_ref < spec.min_notional and guard < 10_000_000:
+                q = round(q + step, 12)
+                guard += 1
+        return round(q, 12)
+
+    # -------------------------------------------------------------------- market
+    async def get_mark_price(self, instrument: Instrument) -> float:
+        rows = await self._public(P_TICKER, {"productType": self.product_type,
+                                             "symbol": instrument.symbol})
+        row = rows[0] if isinstance(rows, list) else rows
+        return float(row.get("markPrice") or row["lastPr"])
+
+    # --------------------------------------------------------------------- order
+    def _order_body(self, order: OrderRequest, spec: InstrumentSpec) -> dict:
+        """Translate an OrderRequest into the VERIFIED V2 place-order body.
+
+        One-way mode: ``side`` is the raw direction and closes use ``reduceOnly=YES``
+        (no V1-style ``open_long``/``close_short`` compound strings, which the
+        analysis doc wrongly assumed).
+        """
+        body = {
+            "symbol": order.instrument.symbol,
+            "productType": self.product_type,
+            "marginMode": order.margin_mode,
+            "marginCoin": self.margin_coin,
+            "size": str(self.round_qty(spec, order.qty, order.price)),
+            "side": "buy" if order.side is Side.BUY else "sell",
+            "orderType": order.order_type,
+            "clientOid": order.client_order_id or self.new_client_oid(),
+        }
+        if order.order_type == "limit":
+            if order.price is None:
+                raise ValueError("limit order requires a price")
+            body["price"] = str(self.round_price(spec, order.price))
+            body["force"] = order.time_in_force
+        else:
+            body["force"] = "ioc" if order.time_in_force == "gtc" else order.time_in_force
+        if order.reduce_only:
+            body["reduceOnly"] = "YES"
+        else:
+            # preset protective levels attach atomically at entry (VERIFIED names)
+            if order.sl is not None:
+                body["presetStopLossPrice"] = str(self.round_price(spec, order.sl))
+            if order.tp is not None:
+                body["presetStopSurplusPrice"] = str(self.round_price(spec, order.tp))
+        return body
+
+    @staticmethod
+    def new_client_oid(prefix: str = "bg") -> str:
+        return f"{prefix}-{uuid.uuid4().hex[:24]}"
+
+    async def place_order(self, order: OrderRequest) -> str:
+        """Place one order. Paper mode short-circuits BEFORE any network call."""
+        spec = await self.get_spec(order.instrument)
+        body = self._order_body(order, spec)
+        if self.paper:
+            oid = body["clientOid"]
+            log.info("PAPER place_order %s %s size=%s price=%s reduce_only=%s",
+                     body["symbol"], body["side"], body["size"], body.get("price"),
+                     order.reduce_only)
+            return f"paper-{oid}"
+        try:
+            data = await self._signed("POST", P_PLACE, body=body)
+        except BitgetError as exc:
+            if not exc.repairable:
+                raise
+            log.warning("order rejected (%s) — deterministic repair, single resubmit", exc.code)
+            self._spec_cache.pop(order.instrument.symbol, None)   # reload real spec
+            spec = await self.get_spec(order.instrument)
+            body = self._order_body(order, spec)
+            data = await self._signed("POST", P_PLACE, body=body)
+        return str(data.get("orderId") or data.get("clientOid"))
+
+    async def place_protective(self, order: OrderRequest, plan_type: str = "loss_plan") -> str:
+        """Place a reduce-only SL/TP plan order (never auto-cancelled — BUG C)."""
+        spec = await self.get_spec(order.instrument)
+        trigger = order.trigger_price if order.trigger_price is not None else order.price
+        if trigger is None:
+            raise ValueError("protective order requires trigger_price or price")
+        body = {
+            "symbol": order.instrument.symbol,
+            "productType": self.product_type,
+            "marginMode": order.margin_mode,
+            "marginCoin": self.margin_coin,
+            "planType": plan_type,                       # loss_plan | profit_plan
+            "triggerPrice": str(self.round_price(spec, trigger)),
+            "triggerType": "mark_price",
+            "holdSide": "long" if order.side is Side.SELL else "short",
+            "size": str(self.round_qty(spec, order.qty, trigger)),
+            "clientOid": order.client_order_id or self.new_client_oid("bgp"),
+        }
+        if self.paper:
+            return f"paper-{body['clientOid']}"
+        data = await self._signed("POST", P_TPSL, body=body)
+        return str(data.get("orderId") or data.get("clientOid"))
+
+    async def cancel_order(self, instrument: Instrument, client_order_id: str) -> bool:
+        if self.paper:
+            log.info("PAPER cancel_order %s %s", instrument.symbol, client_order_id)
+            return True
+        body = {"symbol": instrument.symbol, "productType": self.product_type,
+                "clientOid": client_order_id}
+        await self._signed("POST", P_CANCEL, body=body)
+        return True
+
+    async def get_open_orders(self, instrument: Instrument | None = None) -> list[dict]:
+        params = {"productType": self.product_type}
+        if instrument:
+            params["symbol"] = instrument.symbol
+        data = await self._signed("GET", P_OPEN_ORDERS, params=params)
+        if isinstance(data, dict):
+            return list(data.get("entrustedList") or [])
+        return list(data or [])
+
+    @staticmethod
+    def is_protective(raw_order: dict) -> bool:
+        """True when an exchange order row is a protective reduce-only order (BUG C)."""
+        if str(raw_order.get("reduceOnly", "")).upper() in ("YES", "TRUE", "1"):
+            return True
+        if raw_order.get("planType") in ("loss_plan", "profit_plan", "pos_loss", "pos_profit"):
+            return True
+        return str(raw_order.get("tradeSide", "")).lower() == "close"
+
+    async def cancel_all(self, instrument: Instrument | None = None) -> bool:
+        """Cancel working ENTRY orders only.
+
+        **BUG C:** protective ``reduceOnly`` / plan orders are explicitly skipped, so
+        the dead-man's switch can never strip a position's stop-loss. There is no
+        blanket ``cancel-all`` call here on purpose — we enumerate and filter.
+        """
+        if self.paper:
+            log.info("PAPER cancel_all (protective orders preserved)")
+            return True
+        orders = await self.get_open_orders(instrument)
+        skipped = 0
+        for row in orders:
+            if self.is_protective(row):
+                skipped += 1
+                continue
+            sym = row.get("symbol") or (instrument.symbol if instrument else None)
+            if not sym:
+                continue
+            body = {"symbol": sym, "productType": self.product_type,
+                    "orderId": row.get("orderId")}
+            try:
+                await self._signed("POST", P_CANCEL, body=body)
+            except BitgetError as exc:
+                log.error("cancel_all failed for %s: %s", row.get("orderId"), exc)
+        if skipped:
+            log.info("cancel_all preserved %d protective reduce-only order(s)", skipped)
+        return True
+
+    # ------------------------------------------------------------------ positions
+    async def get_positions(self) -> list[Position]:
+        data = await self._signed("GET", P_POSITIONS,
+                                  params={"productType": self.product_type,
+                                          "marginCoin": self.margin_coin})
+        out: list[Position] = []
+        for row in data or []:
+            size = float(row.get("total") or 0)
+            if size == 0:
+                continue
+            out.append(self._parse_position(row))
+        return out
+
+    @classmethod
+    def _parse_position(cls, row: dict) -> Position:
+        """BUG B: ``liquidationPrice`` is kept REAL — ``None`` if absent, never 0.00."""
+        liq_raw = row.get("liquidationPrice")
+        liq = float(liq_raw) if liq_raw not in (None, "", "0", "0.0") else None
+        hold = str(row.get("holdSide", "long")).lower()
+        return Position(
+            instrument=Instrument.from_token(row["symbol"]),
+            side=Side.BUY if hold == "long" else Side.SELL,
+            size=float(row.get("total") or 0),
+            entry_price=float(row.get("openPriceAvg") or row.get("averageOpenPrice") or 0),
+            leverage=int(float(row.get("leverage") or 1)),
+            liq_price=liq,
+            unrealized_pnl=float(row.get("unrealizedPL") or 0),
+            margin_mode=str(row.get("marginMode") or "isolated"),
+            updated_at_ms=int(row.get("uTime") or 0) or None,
+        )
+
+    # ---------------------------------------------------------------------- fills
+    async def get_fills(self, instrument: Instrument | None = None) -> list[Fill]:
+        params = {"productType": self.product_type}
+        if instrument:
+            params["symbol"] = instrument.symbol
+        data = await self._signed("GET", P_FILLS, params=params)
+        rows = data.get("fillList") if isinstance(data, dict) else data
+        return [self._parse_fill(r) for r in (rows or [])]
+
+    @classmethod
+    def _parse_fill(cls, row: dict) -> Fill:
+        """BUG A: record the REAL fee. Bitget reports it NEGATIVE -> normalize to cost."""
+        fee = 0.0
+        fee_asset = "USDT"
+        details = row.get("feeDetail") or []
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except Exception:
+                details = []
+        for d in details or []:
+            fee += abs(float(d.get("totalFee") or d.get("fee") or 0))
+            fee_asset = d.get("feeCoin") or fee_asset
+        if not details and row.get("fee") is not None:
+            fee = abs(float(row["fee"]))
+        trade_side = str(row.get("tradeSide", "")).lower()
+        return Fill(
+            client_order_id=str(row.get("clientOid") or ""),
+            price=float(row.get("price") or 0),
+            qty=float(row.get("baseVolume") or row.get("size") or 0),
+            side=str(row.get("side", "")).upper(),
+            fee=fee,
+            fee_asset=fee_asset,
+            ts_ms=int(row.get("cTime") or 0),
+            is_reduce=trade_side == "close",
+            exec_type=str(row.get("tradeScope") or row.get("orderType") or ""),
+            order_id=str(row.get("orderId") or ""),
+            symbol=str(row.get("symbol") or ""),
+        )
+
+    # -------------------------------------------------------------------- account
+    async def get_balance_usdt(self) -> float:
+        data = await self._signed("GET", P_ACCOUNTS,
+                                  params={"productType": self.product_type})
+        for row in data or []:
+            if row.get("marginCoin", "").upper() == self.margin_coin.upper():
+                return float(row.get("available") or 0)
+        return 0.0
+
+    async def set_leverage(self, instrument: Instrument, leverage: int,
+                           hold_side: str | None = None) -> None:
+        spec = await self.get_spec(instrument)
+        lev = max(1, min(int(leverage), spec.max_leverage))
+        if self.paper:
+            log.info("PAPER set_leverage %s x%d (capped by pair max %d)",
+                     instrument.symbol, lev, spec.max_leverage)
+            return
+        body = {"symbol": instrument.symbol, "productType": self.product_type,
+                "marginCoin": self.margin_coin, "leverage": str(lev)}
+        if hold_side:
+            body["holdSide"] = hold_side
+        await self._signed("POST", P_SET_LEVERAGE, body=body)
+
+    async def set_trading_stop(self, instrument: Instrument, sl: float | None,
+                               tp: float | None, size: float | None = None) -> None:
+        """Attach/modify protective levels post-open via plan orders."""
+        spec = await self.get_spec(instrument)
+        for price, plan in ((sl, "loss_plan"), (tp, "profit_plan")):
+            if price is None:
+                continue
+            if self.paper:
+                log.info("PAPER set_trading_stop %s %s @ %s", instrument.symbol, plan, price)
+                continue
+            body = {"symbol": instrument.symbol, "productType": self.product_type,
+                    "marginMode": "isolated", "marginCoin": self.margin_coin,
+                    "planType": plan, "triggerPrice": str(self.round_price(spec, price)),
+                    "triggerType": "mark_price",
+                    "clientOid": self.new_client_oid("bgp")}
+            if size:
+                body["size"] = str(self.round_qty(spec, size, price))
+            await self._signed("POST", P_TPSL, body=body)
