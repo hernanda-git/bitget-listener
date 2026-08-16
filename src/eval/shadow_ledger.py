@@ -56,10 +56,7 @@ class LedgerEvalStore(EvalStore):
         self.ledger = ledger
 
     def record(self, pair: str, win: bool, net_usd: float = 0.0) -> None:
-        self.ledger.conn.execute(
-            "INSERT INTO pair_outcomes (pair,win,net_usd,ts_ms) VALUES (?,?,?,0)",
-            (pair.upper(), 1 if win else 0, net_usd))
-        self.ledger.conn.commit()
+        self.ledger.record_outcome(pair, win, net_usd)
 
     def get(self, pair: str) -> list[bool]:
         return self.ledger.outcomes_for(pair)
@@ -67,9 +64,7 @@ class LedgerEvalStore(EvalStore):
     def nets(self, pair: str | None = None) -> list[float]:
         if pair is None:
             return self.ledger.net_pnls()
-        cur = self.ledger.conn.execute(
-            "SELECT net_usd FROM pair_outcomes WHERE pair=?", (pair.upper(),))
-        return [float(r[0]) for r in cur.fetchall()]
+        return self.ledger.nets_for(pair)
 
 
 @dataclass(frozen=True)

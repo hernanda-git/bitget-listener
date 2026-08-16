@@ -12,7 +12,9 @@ inherited bug fixes at the storage boundary:
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 
@@ -70,12 +72,55 @@ class TradeRow:
 
 
 class TradeLedger:
+    """Fee-aware trade ledger.
+
+    Threading discipline (found by a real failure, not theory): the FastAPI
+    dashboard reads the ledger from a worker thread while the trading loop writes
+    from the event loop, and a stock ``sqlite3.Connection`` then raises
+    ``SQLite objects created in a thread can only be used in that same thread``.
+
+    So: file-backed ledgers open a SHORT-LIVED connection per operation, and every
+    access is serialized with a lock. ``:memory:`` must keep one shared connection
+    (a per-call one would see an empty database), so it is opened with
+    ``check_same_thread=False`` and guarded by the same lock.
+    """
+
     def __init__(self, path: str = ":memory:", bot: str = "bitget-listener") -> None:
-        self.conn = sqlite3.connect(path)
-        self.conn.row_factory = sqlite3.Row
+        self.path = path
         self.bot = bot
-        self.conn.executescript(DDL)
-        self.conn.commit()
+        self._lock = threading.RLock()
+        self._shared: sqlite3.Connection | None = None
+        if path == ":memory:":
+            self._shared = self._new_conn()
+        else:
+            self._new_conn().close()      # create the schema on disk once
+
+    def _new_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, check_same_thread=False, timeout=15)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(DDL)
+        conn.commit()
+        return conn
+
+    @contextlib.contextmanager
+    def _conn(self):
+        """Yield a usable connection, serialized across threads."""
+        with self._lock:
+            if self._shared is not None:
+                yield self._shared
+                return
+            conn = self._new_conn()
+            try:
+                yield conn
+            finally:
+                conn.close()
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """Back-compat accessor for callers that hold a connection briefly."""
+        if self._shared is not None:
+            return self._shared
+        return self._new_conn()
 
     # ------------------------------------------------------------------ writing
     def record_open(self, symbol: str, side: str, qty: float, entry_price: float,
@@ -86,15 +131,16 @@ class TradeLedger:
         """Insert an open trade. ``open_fee`` is mandatory (BUG A)."""
         if open_fee is None:
             raise ValueError("open_fee is mandatory — BUG A forbids fee-less records")
-        cur = self.conn.execute(
-            "INSERT INTO trades_log (bot,symbol,side,qty,entry_price,leverage,open_fee,"
-            "sl_price,tp_price,liq_price,paper,client_order_id,decision_id,opened_at_ms)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (self.bot, symbol.upper(), side.upper(), qty, entry_price, leverage, open_fee,
-             sl_price, tp_price, liq_price, 1 if paper else 0, client_order_id, decision_id,
-             int(time.time() * 1000)))
-        self.conn.commit()
-        return int(cur.lastrowid or 0)
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO trades_log (bot,symbol,side,qty,entry_price,leverage,open_fee,"
+                "sl_price,tp_price,liq_price,paper,client_order_id,decision_id,opened_at_ms)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (self.bot, symbol.upper(), side.upper(), qty, entry_price, leverage, open_fee,
+                 sl_price, tp_price, liq_price, 1 if paper else 0, client_order_id,
+                 decision_id, int(time.time() * 1000)))
+            conn.commit()
+            return int(cur.lastrowid or 0)
 
     def record_close(self, trade_id: int, exit_price: float, close_fee: float,
                      exit_reason: str = "", estimated_exit: bool = False,
@@ -111,47 +157,69 @@ class TradeLedger:
         direction = 1 if row["side"].upper() in ("BUY", "LONG") else -1
         gross = (exit_price - row["entry_price"]) * row["qty"] * direction
         net = gross - (row["open_fee"] + close_fee)
-        self.conn.execute(
-            "UPDATE trades_log SET exit_price=?, close_fee=?, gross_usd=?, net_usd=?,"
-            " exit_reason=?, estimated_exit=?, closed_at_ms=? WHERE id=?",
-            (exit_price, close_fee, gross, net, exit_reason, 1 if estimated_exit else 0,
-             int(time.time() * 1000), trade_id))
-        self.conn.execute(
-            "INSERT INTO pair_outcomes (pair,win,net_usd,ts_ms) VALUES (?,?,?,?)",
-            (row["symbol"], 1 if net > 0 else 0, net, int(time.time() * 1000)))
-        self.conn.commit()
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE trades_log SET exit_price=?, close_fee=?, gross_usd=?, net_usd=?,"
+                " exit_reason=?, estimated_exit=?, closed_at_ms=? WHERE id=?",
+                (exit_price, close_fee, gross, net, exit_reason, 1 if estimated_exit else 0,
+                 int(time.time() * 1000), trade_id))
+            conn.execute(
+                "INSERT INTO pair_outcomes (pair,win,net_usd,ts_ms) VALUES (?,?,?,?)",
+                (row["symbol"], 1 if net > 0 else 0, net, int(time.time() * 1000)))
+            conn.commit()
         return TradeRow(id=trade_id, symbol=row["symbol"], side=row["side"], qty=row["qty"],
                         entry_price=row["entry_price"], open_fee=row["open_fee"],
                         close_fee=close_fee, exit_price=exit_price, net_usd=net)
 
+    def record_outcome(self, pair: str, win: bool, net_usd: float = 0.0) -> None:
+        """Append a pair outcome directly (used by the eval store)."""
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO pair_outcomes (pair,win,net_usd,ts_ms) VALUES (?,?,?,?)",
+                (pair.upper(), 1 if win else 0, net_usd, int(time.time() * 1000)))
+            conn.commit()
+
     # ------------------------------------------------------------------ reading
     def get(self, trade_id: int):
-        cur = self.conn.execute("SELECT * FROM trades_log WHERE id=?", (trade_id,))
-        return cur.fetchone()
+        with self._conn() as conn:
+            return conn.execute("SELECT * FROM trades_log WHERE id=?",
+                                (trade_id,)).fetchone()
 
     def open_trades(self) -> list[dict]:
-        cur = self.conn.execute("SELECT * FROM trades_log WHERE closed_at_ms IS NULL")
-        return [dict(r) for r in cur.fetchall()]
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM trades_log WHERE closed_at_ms IS NULL").fetchall()]
 
     def closed_trades(self, limit: int = 200) -> list[dict]:
-        cur = self.conn.execute(
-            "SELECT * FROM trades_log WHERE closed_at_ms IS NOT NULL"
-            " ORDER BY closed_at_ms DESC LIMIT ?", (limit,))
-        return [dict(r) for r in cur.fetchall()]
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM trades_log WHERE closed_at_ms IS NOT NULL"
+                " ORDER BY closed_at_ms DESC LIMIT ?", (limit,)).fetchall()]
 
     def net_pnls(self) -> list[float]:
-        cur = self.conn.execute(
-            "SELECT net_usd FROM trades_log WHERE net_usd IS NOT NULL")
-        return [float(r[0]) for r in cur.fetchall()]
+        with self._conn() as conn:
+            return [float(r[0]) for r in conn.execute(
+                "SELECT net_usd FROM trades_log WHERE net_usd IS NOT NULL").fetchall()]
 
     def total_fees(self) -> float:
-        cur = self.conn.execute("SELECT COALESCE(SUM(open_fee+close_fee),0) FROM trades_log")
-        return float(cur.fetchone()[0])
+        with self._conn() as conn:
+            return float(conn.execute(
+                "SELECT COALESCE(SUM(open_fee+close_fee),0) FROM trades_log").fetchone()[0])
 
     def outcomes_for(self, pair: str) -> list[bool]:
-        cur = self.conn.execute(
-            "SELECT win FROM pair_outcomes WHERE pair=? ORDER BY id", (pair.upper(),))
-        return [bool(r[0]) for r in cur.fetchall()]
+        with self._conn() as conn:
+            return [bool(r[0]) for r in conn.execute(
+                "SELECT win FROM pair_outcomes WHERE pair=? ORDER BY id",
+                (pair.upper(),)).fetchall()]
+
+    def nets_for(self, pair: str) -> list[float]:
+        with self._conn() as conn:
+            return [float(r[0]) for r in conn.execute(
+                "SELECT net_usd FROM pair_outcomes WHERE pair=?",
+                (pair.upper(),)).fetchall()]
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            if self._shared is not None:
+                self._shared.close()
+                self._shared = None
