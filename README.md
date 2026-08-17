@@ -38,8 +38,9 @@ All secrets go in `.env` (git-ignored). See `.env.example`. Key vars:
 - `PAPER` — `1` (default) boots paper; the persisted flag in the config store wins.
 - `SYMBOL_WHITELIST` — comma list, e.g. `BTCUSDT,ETHUSDT,SOLUSDT`.
 - `LEDGER_PATH` — trade ledger DB (default `bitget_listger.db`).
-- `WEB_PORT` / `WEB_ACTION_PASSWORD` — dashboard port + the password for state-changing
-  endpoints only (monitoring loads OPEN, no login gate).
+- `PORT` / `DASH_PASSWORD` — dashboard port (default 8080) + the password for
+  state-changing endpoints only (monitoring loads OPEN, no login gate). Sent via the
+  `x-dash-password` header; every control attempt is logged server-side at ERROR.
 - `DEADMAN_TTL_S` — feed-staleness halt window (default 60s).
 - `PGHOST` / `PGDATABASE` / … — if set, the bot uses the shared `fatty_config` Postgres
   row for the persisted `paper` flag; otherwise an in-memory store is used.
