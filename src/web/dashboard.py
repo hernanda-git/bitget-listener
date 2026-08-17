@@ -119,6 +119,7 @@ def create_app(orchestrator, password: str | None = None) -> FastAPI:
             "activities": [],         # bitget logs control actions server-side at ERROR
             "gate": snap.get("gate"),
             "skipped": snap.get("skipped", []),
+            "equity_history": snap.get("equity_history", []),
             "server_time": jakarta(int(datetime.now(timezone.utc).timestamp() * 1000)),
         })
 
@@ -269,6 +270,17 @@ a{color:var(--accent-600)}
 .mkt-flat{height:34px;border-radius:var(--r-xs);background:linear-gradient(90deg,var(--line),transparent,var(--line));opacity:.4}
 .kpi-spark{margin-top:6px;height:26px}
 .kpi-spark .spark{display:block}
+.chart-tabs{display:flex;gap:var(--s2);margin-bottom:var(--s3);flex-wrap:wrap}
+.chip{padding:6px 12px;border-radius:999px;border:1px solid var(--line);background:var(--surface-2);
+  color:var(--ink-soft);font-size:.72rem;font-weight:700;cursor:pointer;transition:.15s;font-family:var(--ff);min-height:40px}
+.chip:hover{border-color:var(--accent-ring);color:var(--ink)}
+.chip.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.chart-wrap{width:100%;height:220px;background:var(--surface-2);border-radius:var(--r-sm);overflow:hidden}
+.chart{width:100%;height:100%;display:block}
+.chart .line{fill:none;stroke:var(--accent);stroke-width:2;vector-effect:non-scaling-stroke}
+.chart .area{fill:url(#walletFill);opacity:.5}
+.chart .axis{stroke:var(--line);stroke-width:1;vector-effect:non-scaling-stroke}
+.chart .lbl{fill:var(--mut-2);font-size:11px;font-family:var(--mono)}
 .kpi-value.muted{color:var(--mut-2);font-weight:700}
 .grid2x2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:var(--s4);margin-top:var(--s4)}
 .grid2col{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);gap:var(--s4);margin-top:var(--s4)}
@@ -427,6 +439,22 @@ tbody tr:last-child td{border-bottom:0}tbody tr:hover{background:var(--surface-2
       <div class="card-body"><div id="gate"></div></div>
     </section>
 
+    <section class="section card">
+      <div class="card-head"><h2>Wallet history</h2><span class="hint" id="walletHint">equity (cum PnL)</span></div>
+      <div class="card-body">
+        <div class="chart-tabs">
+          <button class="chip active" data-series="equity">Equity</button>
+          <button class="chip" data-series="fees">Fees paid</button>
+          <button class="chip" data-series="open">Open positions</button>
+        </div>
+        <div class="chart-wrap"><svg id="walletChart" viewBox="0 0 600 220" preserveAspectRatio="none" class="chart"></svg></div>
+        <div class="table-wrap" style="margin-top:12px;max-height:240px">
+          <table><thead><tr><th>Time (WIB)</th><th>Equity</th><th>Fees</th><th>Open</th></tr></thead><tbody id="walletBody"></tbody></table>
+        </div>
+        <div class="empty" id="walletEmpty" style="display:none"><span>No wallet samples yet — first sample in ~60s.</span></div>
+      </div>
+    </section>
+
     <div class="grid2x2">
       <section class="card">
         <div class="card-head"><h2>Open positions</h2><span class="hint" id="posCount">0</span></div>
@@ -535,6 +563,7 @@ async function refresh(){
 }
 function renderSnapshot(s){
   if(!s)return;
+  window.__lastSnap = s;
   const paper=!!s.paper;setModeUI(paper);
   if($('ms_mode')){const me=$('ms_mode');me.textContent=paper?'PAPER':'LIVE';me.className='acct-pill '+(paper?'paper':'live');}
   if($('ms_watch'))$('ms_watch').textContent=(s.market&&Object.keys(s.market).length)?Object.keys(s.market).length+' pairs':'—';
@@ -567,6 +596,8 @@ function renderSnapshot(s){
   // skips / rejections
   const sk=$('skips');const skipped=(s.skipped&&s.skipped.length)?s.skipped:(s.gate&&s.gate.unmet?[]:[]);
   sk.innerHTML=(skipped&&skipped.length)?'<ul style="margin:0;padding-left:18px;color:var(--ink-soft);font-size:.8rem">'+skipped.map(x=>'<li>'+esc(x.symbol||'?')+': '+esc(x.reason||'')+'</li>').join('')+'</ul>':'<span>None.</span>';
+  // wallet history (table + chart)
+  renderWallet(s.equity_history||[]);
   // stats
   $('s_total').textContent=st.total_trades||0;$('s_wl').textContent=(st.wins||0)+' / '+(st.losses||0);
   $('s_wr').textContent=st.win_rate?st.win_rate+'%':'—';$('s_pf').textContent=st.profit_factor?st.profit_factor:'—';
@@ -575,6 +606,50 @@ function renderSnapshot(s){
   // activity (bitget logs control actions server-side; show gate unmet as muted rows)
   $('health').textContent='poll 5s · listening since '+logTime(Math.floor(Date.now()/1000))+' · updated '+logTime(Math.floor(Date.now()/1000));
 }
+
+// ── wallet history chart + table ──
+let WALLET_SERIES = 'equity';
+function renderWallet(hist){
+  const wb=$('walletBody');const empty=$('walletEmpty');const chart=$('walletChart');
+  if(!hist||!hist.length){empty.style.display='';wb.innerHTML='';chart.innerHTML='';return;}
+  empty.style.display='none';
+  // table (newest first, last 50)
+  const rows=hist.slice(-50).slice().reverse();
+  wb.innerHTML=rows.map(r=>{
+    const d=new Date(r.ts_ms/1000);
+    const t=d.toLocaleString('en-GB',{timeZone:'Asia/Jakarta',hour12:false}).replace(',',' ');
+    return '<tr><td class="num">'+esc(t)+' WIB</td><td class="num">'+fmt(r.equity_usd)+
+      '</td><td class="num">'+fmt(r.fees_usd)+'</td><td class="num">'+r.open_pos+'</td></tr>';
+  }).join('');
+  drawWalletChart(hist, WALLET_SERIES);
+}
+function drawWalletChart(hist, series){
+  const svg=$('walletChart');const W=600,H=220,pad=28;
+  const vals=hist.map(r=>series==='fees'?r.fees_usd:(series==='open'?r.open_pos:r.equity_usd));
+  const min=Math.min.apply(null,vals), max=Math.max.apply(null,vals);
+  const span=(max-min)||1; const n=vals.length;
+  const X=i=>pad+(i/(Math.max(n-1,1)))*(W-pad*2);
+  const Y=v=>H-pad-((v-min)/span)*(H-pad*2);
+  let line='', area='';
+  vals.forEach((v,i)=>{const x=X(i).toFixed(1),y=Y(v).toFixed(1);
+    line+=(i?'L':'M')+x+' '+y+' '; area+=(i?('L'+x+' '+y+' '):('M'+x+' '+y+' '));});
+  area+='L'+X(n-1).toFixed(1)+' '+(H-pad)+' L'+X(0).toFixed(1)+' '+(H-pad)+' Z';
+  const col=series==='fees'?'var(--warn)':(series==='open'?'var(--accent-600)':'var(--accent)');
+  svg.innerHTML='<defs><linearGradient id="walletFill" x1="0" y1="0" x2="0" y2="1">'+
+    '<stop offset="0%" stop-color="'+col+'" stop-opacity="0.35"/>'+
+    '<stop offset="100%" stop-color="'+col+'" stop-opacity="0"/></linearGradient></defs>'+
+    '<path class="area" d="'+area+'"/>'+
+    '<path class="line" d="'+line+'" style="stroke:'+col+'"/>'+
+    '<text class="lbl" x="4" y="14">'+fmt(max)+'</text>'+
+    '<text class="lbl" x="4" y="'+(H-8)+'">'+fmt(min)+'</text>'+
+    '<text class="lbl" x="'+(W-pad-2)+'" y="'+(H-8)+'" text-anchor="end">'+hist.length+' pts</text>';
+}
+document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{
+  document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('active',x===c));
+  WALLET_SERIES=c.dataset.series;
+  const el=$('walletBody'); // re-render uses last snapshot via global
+  if(window.__lastSnap) drawWalletChart(window.__lastSnap.equity_history||[], WALLET_SERIES);
+});
 
 // ── control (bitget gated endpoints) ──
 $('c_topaper').onclick=async()=>{const body=withPw({});if(!body)return;

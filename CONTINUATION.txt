@@ -1,0 +1,63 @@
+# CONTINUATION TASK — finish the autonomous build of ~/bitget-listener
+
+Context: you are continuing a build that is already mostly done. The repo
+~/bitget-listener is cloned, siblings are referenced, and MASTER-PROMPT.md is the
+authoritative spec. The goal is a Bitget perpetual-futures signal-copy trading bot,
+paper-ready behind a hardened go-live gate. Do NOT ask for confirmation — the repo
+and its MASTER-PROMPT.md are self-contained. Follow MASTER-PROMPT.md's hard rules
+and TDD sequence (P0-P10) verbatim; AUDIT-PLAN.md is the ⬜️/✅ checkpoint ledger.
+
+## FIRST, LEARN THE EXACT CURRENT STATE (do not assume — verify before touching)
+1. cd ~/bitget-listener && git status        # see what is uncommitted
+2. git log --oneline -5                      # see what is already pushed
+3. bash scripts/run_tests.sh                 # expect 310+ tests pass + smoke OK
+4. ls sibling-repos/  and confirm whether siblings.tar.gz was extracted
+   (tar -xzf sibling-repos/siblings.tar.gz if missing — the build already grafted
+   the needed sibling logic inline, so this is likely optional, but check MASTER-PROMPT)
+
+## WHAT IS ALREADY DONE AND VERIFIED (do not redo)
+- P0-P10 built: domain, ports, fakes, parser, Bitget REST+WS adapters (fee-aware,
+  demo-symbol translation), order/position services, real-time stops, ShadowLedger
+  reflexivity, dead-man switch, GoLiveGate (5 conditions + single-use TTL token,
+  persisted paper flag), ConfigStore, Orchestrator, dashboard, entrypoint main.py.
+- 310 fakes-only tests green. scripts/verify_dashboard_ui.py passes 24/24 real
+  headless-Chromium checks at 390x844 (DOM values diffed vs /api/state).
+- scripts/smoke_paper_run.py passes against the REAL Bitget demo product with NO keys.
+- Hard blockers correctly NOT attempted: real Bitget keys/KYC, live Telethon session.
+- Commits already on main: e23647e (P5-P9) and 35924ca (P10 dashboard + UI verify).
+
+## WHAT IS STILL OPEN (high probability these are UNCOMMITTED on disk — confirm via git status)
+- Demo symbol translation (BTCUSDT -> SBTCSUSDT) in src/exchanges/bitget.py and
+  src/streaming/bitget_ws.py, with canonical_symbol() inverse mapping.
+- Paper-no-creds fix in src/services/orchestrator.py (tracks position locally
+  instead of calling signed positions.sync()).
+- tests/test_phase11_demo_symbols_and_paper.py (regression tests for the two bugs
+  above) — must be collected and passing.
+- Possibly dashboard.py / scripts/verify_dashboard_ui.py edits (stacked cards at <600px,
+  "Net P&L (after fees)" label, Size column in closed trades).
+- AUDIT-PLAN.md updated to all-P0-P10 ✅.
+
+## EXACT NEXT STEPS (autonomous)
+1. Run the verification block above. If tests are red, STOP and fix before committing.
+2. Atomic-commit the pending work:
+     git -c user.name=𝕧𝕒𝕝𝕒𝕣𝕚𝕠𝕟 -c user.email=42990222+hernanda-git@users.noreply.github.com add -A
+     git -c ... commit -m "P11: demo symbol translation + paper-no-creds fixes, regression tests, live no-key smoke (310 tests + 24 UI checks green)"
+3. Write README.md (architecture, run modes: paper/live/--probe/--web, env vars,
+   go-live procedure) and RUNBOOK.md (ops: how to monitor, how to go live safely,
+   how to revert to paper, hard blockers). Keep them concise and honest.
+4. Wire the MASTER-PROMPT "self-healing lock-file discipline" into main.py / a cron
+   hook if not already done (check MASTER-PROMPT for the exact mechanism — it is about
+   a lockfile preventing concurrent runs plus a self-heal step; do not invent one).
+5. Push to main of the private repo: git push origin main
+6. Report the final test count, smoke result, and confirm NO keys were fabricated and
+   go-live is still BLOCKED.
+
+## NON-NEGOTIABLE RULES
+- Never fabricate API keys, passphrases, or claim go-live. The bot must stay in paper
+  until a human supplies real keys and the gate's 5 conditions + token are satisfied.
+- Monitoring dashboard loads OPEN (no login gate); only state-changing endpoints are
+  password gated; every control action is logged server-side at ERROR.
+- All timestamps Asia/Jakarta (UTC+7). No horizontal scroll at 390px. Verify UI with a
+  REAL headless browser, not curl/200. Diff rendered DOM VALUES against the API.
+- Never count elements as "done" — prove it with real execution evidence.
+- Atomic commits with the hernanda-git identity shown above.

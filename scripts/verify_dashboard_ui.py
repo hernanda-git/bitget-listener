@@ -60,6 +60,15 @@ def build_app():
     t2 = ledger.record_open("ETHUSDT", "SELL", 0.5, 2_500.0, open_fee=0.75, leverage=10)
     ledger.record_close(t2, exit_price=2_560.0, close_fee=0.768, exit_reason="stop_breached")
     orch.skipped.append({"symbol": "DOGEUSDT", "reason": "not whitelisted"})
+    # seed wallet-equity history so the chart + table are exercisable
+    import time as _t
+    base = int(_t.time() * 1000)
+    for i in range(12):
+        orch.ledger.record_equity(
+            ts_ms=base - (12 - i) * 60_000,
+            equity_usd=27.726 * (i + 1) / 12,
+            fees_usd=1.314 * (i + 1) / 12,
+            open_pos=1 if i % 3 == 0 else 0)
     return create_app(orch, password="verify-pw"), orch
 
 
@@ -157,6 +166,23 @@ async def browser_checks(state):
         check("unmet go-live conditions are surfaced in the UI",
               "blocked by" in dom["gate"] and len(state["gate"]["unmet"]) == 5,
               f'unmet={len(state["gate"]["unmet"])}')
+
+        # wallet history table + chart (new feature)
+        wh_rows = await page.evaluate("() => document.querySelectorAll('#walletBody tr').length")
+        check("wallet history table is populated", wh_rows > 0,
+              f'rows={wh_rows} api={len(state.get("equity_history", []))}')
+        chart_paths = await page.evaluate("""() => {
+            const svg=document.querySelector('#walletChart');
+            return {line: !!svg.querySelector('.line'), area: !!svg.querySelector('.area')};}""")
+        check("wallet equity chart renders an SVG line+area",
+              chart_paths["line"] and chart_paths["area"], chart_paths)
+        # chip switch to 'fees' re-renders without error
+        await page.click('.chip[data-series="fees"]')
+        fees_line = await page.evaluate("""() => {
+            const svg=document.querySelector('#walletChart');
+            const p=svg.querySelector('.line'); return p?p.getAttribute('style'):'';}""")
+        check("wallet chart chip switches series (fees)", "var(--warn)" in fees_line, fees_line)
+        await page.click('.chip[data-series="equity"]')
 
         # net P&L numerically matches (format may differ 2 vs 4 dp)
         try:

@@ -51,6 +51,15 @@ CREATE TABLE IF NOT EXISTS pair_outcomes (
     net_usd REAL NOT NULL DEFAULT 0,
     ts_ms   INTEGER
 );
+CREATE TABLE IF NOT EXISTS equity_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot         TEXT NOT NULL DEFAULT 'bitget-listener',
+    ts_ms       INTEGER NOT NULL,
+    equity_usd  REAL NOT NULL,
+    fees_usd    REAL NOT NULL DEFAULT 0,
+    open_pos    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_log(ts_ms);
 """
 
 
@@ -217,6 +226,26 @@ class TradeLedger:
             return [float(r[0]) for r in conn.execute(
                 "SELECT net_usd FROM pair_outcomes WHERE pair=?",
                 (pair.upper(),)).fetchall()]
+
+    # ------------------------------------------------------------------ equity history
+    def record_equity(self, ts_ms: int, equity_usd: float,
+                      fees_usd: float = 0.0, open_pos: int = 0) -> None:
+        """Append one wallet-equity sample (the historical series for the chart)."""
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO equity_log (bot, ts_ms, equity_usd, fees_usd, open_pos) "
+                "VALUES (?,?,?,?,?)",
+                (self.bot, int(ts_ms), float(equity_usd), float(fees_usd), int(open_pos)))
+            conn.commit()
+
+    def equity_history(self, limit: int = 500) -> list[dict]:
+        """Newest-last wallet-equity samples, for charting / table."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT ts_ms, equity_usd, fees_usd, open_pos FROM equity_log "
+                "ORDER BY ts_ms ASC LIMIT ?", (limit,)).fetchall()
+            return [{"ts_ms": int(r[0]), "equity_usd": float(r[1]),
+                     "fees_usd": float(r[2]), "open_pos": int(r[3])} for r in rows]
 
     def close(self) -> None:
         with self._lock:

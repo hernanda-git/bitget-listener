@@ -250,6 +250,34 @@ class Orchestrator:
             await self.deadman.start()
         self._running = True
         self._task = asyncio.create_task(self._loop())
+        self._equity_task = asyncio.create_task(self._equity_sampler())
+
+    async def _equity_sampler(self) -> None:
+        """Periodically append a wallet-equity sample so the dashboard can chart
+        historical balance even when no trades are happening."""
+        import time as _t
+        while self._running:
+            try:
+                await asyncio.sleep(getattr(self, "equity_sample_sec", 60))
+                self._record_equity_sample()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - sampler must never kill the bot
+                log.exception("equity sampler error: %s", exc)
+
+    def _record_equity_sample(self) -> None:
+        try:
+            import time as _t
+            nets = self.ledger.net_pnls()
+            equity = sum(nets)
+            self.ledger.record_equity(
+                ts_ms=int(_t.time() * 1000),
+                equity_usd=equity,
+                fees_usd=self.ledger.total_fees(),
+                open_pos=len(self.positions.positions),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("equity sample skipped: %s", exc)
 
     async def _loop(self) -> None:
         queue = self.source.subscribe()
@@ -267,10 +295,11 @@ class Orchestrator:
 
     async def stop(self) -> None:
         self._running = False
-        if self._task:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._task
+        for tk in (self._task, getattr(self, "_equity_task", None)):
+            if tk:
+                tk.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await tk
         for comp in (self.deadman, self.stream, self.source):
             if comp is not None:
                 with contextlib.suppress(Exception):
@@ -294,4 +323,5 @@ class Orchestrator:
             "deadman_halted": bool(self.deadman.halted) if self.deadman else False,
             "flagged_pairs": self.shadow.weak_pairs(),
             "skipped": self.skipped[-20:],
+            "equity_history": self.ledger.equity_history(500),
         }
