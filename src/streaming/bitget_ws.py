@@ -69,6 +69,30 @@ class BitgetWS(MarketStream):
         self.on_ready: Callback | None = None
         self.on_lost: Callback | None = None
 
+    # ------------------------------------------------------------------ symbols
+    @property
+    def is_demo(self) -> bool:
+        return self.product_type.upper().startswith("S")
+
+    def venue_symbol(self, symbol: str) -> str:
+        """Canonical -> venue. Demo lists SBTCSUSDT, not BTCUSDT (VERIFIED)."""
+        sym = symbol.upper()
+        if not self.is_demo:
+            return sym
+        if sym.startswith("S") and sym.endswith("SUSDT"):
+            return sym
+        base = sym[:-4] if sym.endswith("USDT") else sym
+        return f"S{base}SUSDT"
+
+    def canonical_symbol(self, venue_symbol: str) -> str:
+        """Venue -> canonical, so callbacks always report BTCUSDT."""
+        sym = venue_symbol.upper()
+        if not self.is_demo:
+            return sym
+        if sym.startswith("S") and sym.endswith("SUSDT"):
+            return f"{sym[1:-5]}USDT"
+        return sym
+
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
         if self._running:
@@ -104,8 +128,8 @@ class BitgetWS(MarketStream):
             args = [{"instType": self.product_type, "channel": ch, "coin": "default"}
                     for ch in ("orders", "positions", "account")]
         else:
-            args = [{"instType": self.product_type, "channel": "ticker", "instId": s}
-                    for s in self.symbols]
+            args = [{"instType": self.product_type, "channel": "ticker",
+                     "instId": self.venue_symbol(s)} for s in self.symbols]
         return {"op": "subscribe", "args": args}
 
     def login_frame(self) -> dict:
@@ -190,7 +214,7 @@ class BitgetWS(MarketStream):
         data = msg.get("data") or []
         if channel == "ticker":
             for row in data:
-                sym = str(row.get("instId") or "").upper()
+                sym = self.canonical_symbol(str(row.get("instId") or "").upper())
                 px = row.get("markPrice") or row.get("lastPr")
                 if sym and px:
                     self._marks[sym] = float(px)

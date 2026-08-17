@@ -129,7 +129,27 @@ class Orchestrator:
             sl_price=order.sl, tp_price=order.tp, paper=(status == "PAPER"),
             client_order_id=order.client_order_id, decision_id=str(signal.message_id or ""))
         self.open_trade_ids[order.instrument.symbol] = tid
-        await self.positions.sync()
+        # Paper mode must run with NO credentials, so it must never call a signed
+        # endpoint. Track the position locally instead of syncing from the venue.
+        if status == "PAPER":
+            from src.domain.model import Position
+            self.positions.upsert(Position(
+                instrument=order.instrument, side=order.side, size=order.qty,
+                entry_price=order.price or signal.entry or 0.0,
+                leverage=order.leverage, sl_price=order.sl, tp_price=order.tp,
+                margin_mode=order.margin_mode))
+        else:
+            try:
+                await self.positions.sync()
+            except Exception as exc:
+                # A failed sync must not lose the position we just opened.
+                log.error("position sync failed after open (%s) — keeping local view", exc)
+                from src.domain.model import Position
+                self.positions.upsert(Position(
+                    instrument=order.instrument, side=order.side, size=order.qty,
+                    entry_price=order.price or signal.entry or 0.0,
+                    leverage=order.leverage, sl_price=order.sl, tp_price=order.tp,
+                    margin_mode=order.margin_mode))
         if self.notifier is not None:
             from src.notifier.telegram import TelegramNotifier
             with contextlib.suppress(Exception):

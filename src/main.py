@@ -23,6 +23,7 @@ from src.eval.shadow_ledger import LedgerEvalStore, ShadowLedger
 from src.exchanges.bitget import BitgetAdapter
 from src.notifier.golive import GateConditions, GoLiveGate
 from src.notifier.telegram import TelegramNotifier
+from src.services.audit_lock import AuditLock, AuditLockError
 from src.services.deadman import DeadManSwitch
 from src.services.orchestrator import Orchestrator
 from src.services.risk import RiskLimits
@@ -102,27 +103,38 @@ async def cmd_run(args) -> int:
     log.warning("starting in %s mode (product_type=%s)",
                 "PAPER" if orch.gate.paper else "LIVE",
                 cfg.params.get("product_type"))
-    if args.web:
-        import uvicorn
+    # Self-healing lock-file discipline (MASTER-PROMPT): only one live run/--web
+    # tick may hold the process. A stale (>=30m) or dead-owned lock self-heals.
+    lock = AuditLock(phase="run" + ("/web" if args.web else ""))
+    try:
+        lock.acquire()
+    except AuditLockError as exc:
+        log.error("refusing to start: another live tick holds .audit.lock (%s)", exc)
+        return 1
+    try:
+        if args.web:
+            import uvicorn
 
-        from src.web.dashboard import create_app
-        app = create_app(orch)
-        await orch.start()
-        server = uvicorn.Server(uvicorn.Config(
-            app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")), log_level="info"))
+            from src.web.dashboard import create_app
+            app = create_app(orch)
+            await orch.start()
+            server = uvicorn.Server(uvicorn.Config(
+                app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")), log_level="info"))
+            try:
+                await server.serve()
+            finally:
+                await orch.stop()
+            return 0
         try:
-            await server.serve()
+            await orch.start()
+            while True:
+                await asyncio.sleep(3600)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
         finally:
             await orch.stop()
-        return 0
-    try:
-        await orch.start()
-        while True:
-            await asyncio.sleep(3600)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
     finally:
-        await orch.stop()
+        lock.release()
     return 0
 
 

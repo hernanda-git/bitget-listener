@@ -103,6 +103,32 @@ class BitgetAdapter(ExchangeAdapter):
         """True when pointed at Bitget's demo product (`SUSDT-FUTURES`)."""
         return self.product_type.startswith("S")
 
+    def venue_symbol(self, symbol: str) -> str:
+        """Translate a canonical symbol into the venue's symbol for this product type.
+
+        VERIFIED against the live API: the demo product does NOT list ``BTCUSDT``.
+        ``productType=SUSDT-FUTURES`` exposes exactly three contracts — ``SBTCSUSDT``,
+        ``SETHSUSDT``, ``SXRPSUSDT`` — i.e. an ``S`` prefix and a ``SUSDT`` quote.
+        Without this translation every demo order fails with NO_SPEC, which is
+        precisely how the first end-to-end paper run broke.
+        """
+        sym = symbol.upper()
+        if not self.is_demo:
+            return sym
+        if sym.startswith("S") and sym.endswith("SUSDT"):
+            return sym                      # already a demo symbol
+        base = sym[:-4] if sym.endswith("USDT") else sym
+        return f"S{base}SUSDT"
+
+    def canonical_symbol(self, venue_symbol: str) -> str:
+        """Inverse of :meth:`venue_symbol`, so responses map back to our domain."""
+        sym = venue_symbol.upper()
+        if not self.is_demo:
+            return sym
+        if sym.startswith("S") and sym.endswith("SUSDT"):
+            return f"{sym[1:-5]}USDT"
+        return sym
+
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=20)
@@ -159,10 +185,10 @@ class BitgetAdapter(ExchangeAdapter):
         if instrument.symbol in self._spec_cache:
             return self._spec_cache[instrument.symbol]
         rows = await self._public(P_CONTRACTS, {"productType": self.product_type,
-                                                "symbol": instrument.symbol})
+                                                "symbol": self.venue_symbol(instrument.symbol)})
         if not rows:
             raise BitgetError("NO_SPEC", f"no contract for {instrument.symbol}", P_CONTRACTS)
-        spec = self._parse_spec(rows[0])
+        spec = self._parse_spec({**rows[0], "symbol": instrument.symbol})
         self._spec_cache[instrument.symbol] = spec
         return spec
 
@@ -223,7 +249,7 @@ class BitgetAdapter(ExchangeAdapter):
     # -------------------------------------------------------------------- market
     async def get_mark_price(self, instrument: Instrument) -> float:
         rows = await self._public(P_TICKER, {"productType": self.product_type,
-                                             "symbol": instrument.symbol})
+                                             "symbol": self.venue_symbol(instrument.symbol)})
         row = rows[0] if isinstance(rows, list) else rows
         return float(row.get("markPrice") or row["lastPr"])
 
@@ -236,7 +262,7 @@ class BitgetAdapter(ExchangeAdapter):
         analysis doc wrongly assumed).
         """
         body = {
-            "symbol": order.instrument.symbol,
+            "symbol": self.venue_symbol(order.instrument.symbol),
             "productType": self.product_type,
             "marginMode": order.margin_mode,
             "marginCoin": self.margin_coin,
@@ -295,7 +321,7 @@ class BitgetAdapter(ExchangeAdapter):
         if trigger is None:
             raise ValueError("protective order requires trigger_price or price")
         body = {
-            "symbol": order.instrument.symbol,
+            "symbol": self.venue_symbol(order.instrument.symbol),
             "productType": self.product_type,
             "marginMode": order.margin_mode,
             "marginCoin": self.margin_coin,
@@ -315,7 +341,7 @@ class BitgetAdapter(ExchangeAdapter):
         if self.paper:
             log.info("PAPER cancel_order %s %s", instrument.symbol, client_order_id)
             return True
-        body = {"symbol": instrument.symbol, "productType": self.product_type,
+        body = {"symbol": self.venue_symbol(instrument.symbol), "productType": self.product_type,
                 "clientOid": client_order_id}
         await self._signed("POST", P_CANCEL, body=body)
         return True
@@ -323,7 +349,7 @@ class BitgetAdapter(ExchangeAdapter):
     async def get_open_orders(self, instrument: Instrument | None = None) -> list[dict]:
         params = {"productType": self.product_type}
         if instrument:
-            params["symbol"] = instrument.symbol
+            params["symbol"] = self.venue_symbol(instrument.symbol)
         data = await self._signed("GET", P_OPEN_ORDERS, params=params)
         if isinstance(data, dict):
             return list(data.get("entrustedList") or [])
@@ -377,6 +403,10 @@ class BitgetAdapter(ExchangeAdapter):
             size = float(row.get("total") or 0)
             if size == 0:
                 continue
+            # Map the venue symbol back to canonical so the rest of the bot only
+            # ever sees BTCUSDT, never the demo's SBTCSUSDT.
+            row = {**row, "symbol": self.canonical_symbol(
+                str(row.get("symbol") or row.get("instId") or ""))}
             out.append(self._parse_position(row))
         return out
 
@@ -402,10 +432,11 @@ class BitgetAdapter(ExchangeAdapter):
     async def get_fills(self, instrument: Instrument | None = None) -> list[Fill]:
         params = {"productType": self.product_type}
         if instrument:
-            params["symbol"] = instrument.symbol
+            params["symbol"] = self.venue_symbol(instrument.symbol)
         data = await self._signed("GET", P_FILLS, params=params)
         rows = data.get("fillList") if isinstance(data, dict) else data
-        return [self._parse_fill(r) for r in (rows or [])]
+        return [self._parse_fill({**r, "symbol": self.canonical_symbol(
+            str(r.get("symbol") or r.get("instId") or ""))}) for r in (rows or [])]
 
     @classmethod
     def _parse_fill(cls, row: dict) -> Fill:
@@ -455,7 +486,7 @@ class BitgetAdapter(ExchangeAdapter):
             log.info("PAPER set_leverage %s x%d (capped by pair max %d)",
                      instrument.symbol, lev, spec.max_leverage)
             return
-        body = {"symbol": instrument.symbol, "productType": self.product_type,
+        body = {"symbol": self.venue_symbol(instrument.symbol), "productType": self.product_type,
                 "marginCoin": self.margin_coin, "leverage": str(lev)}
         if hold_side:
             body["holdSide"] = hold_side
@@ -471,7 +502,7 @@ class BitgetAdapter(ExchangeAdapter):
             if self.paper:
                 log.info("PAPER set_trading_stop %s %s @ %s", instrument.symbol, plan, price)
                 continue
-            body = {"symbol": instrument.symbol, "productType": self.product_type,
+            body = {"symbol": self.venue_symbol(instrument.symbol), "productType": self.product_type,
                     "marginMode": "isolated", "marginCoin": self.margin_coin,
                     "planType": plan, "triggerPrice": str(self.round_price(spec, price)),
                     "triggerType": "mark_price",
