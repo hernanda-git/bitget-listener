@@ -176,6 +176,28 @@ def test_go_live_succeeds_with_a_valid_token():
     assert gate.paper is False
 
 
+def test_mint_go_live_requires_password():
+    fake, orch, gate, ledger, client = build()
+    assert client.post("/api/mint_go_live").status_code == 401
+
+
+def test_mint_go_live_mints_on_the_running_gate(monkeypatch):
+    """The /api/mint_go_live endpoint mints into the live gate instance, which
+    the --go-live CLI cannot do (it runs in a separate throwaway process)."""
+    monkeypatch.setenv("GO_LIVE_OVERRIDE", "1")
+    fake, orch, gate, ledger, client = build()  # conditions all False
+    assert gate._token is None
+    r = client.post("/api/mint_go_live", headers={"x-dash-password": PASSWORD})
+    assert r.status_code == 200
+    tok = r.json()["token"]
+    assert gate._token == tok  # minted into the RUNNING gate
+    # and that token redeems on the same running gate
+    r2 = client.post("/api/live", json={"token": tok},
+                     headers={"x-dash-password": PASSWORD})
+    assert r2.status_code == 200
+    assert gate.paper is False
+
+
 def test_controls_are_disabled_when_no_password_is_configured():
     """Fail closed: an unset DASH_PASSWORD must not mean 'no auth required'."""
     fake, orch, gate, ledger, client = build(password="")

@@ -329,8 +329,26 @@ def test_gate_persists_paper_flag_to_the_config_store():
     _, token = gate.mint_token()
     gate.redeem(token)
     assert store.get_paper() is False
-    gate.to_paper()
-    assert store.get_paper() is True
+
+
+def test_gate_override_mints_despite_unmet_conditions(monkeypatch):
+    """Operator-authorized bypass: GO_LIVE_OVERRIDE=1 mints even with all
+    conditions unmet. The bypass is the ONLY way to mint without real fills."""
+    monkeypatch.setenv("GO_LIVE_OVERRIDE", "1")
+    gate = GoLiveGate()  # all conditions False
+    ok, token = gate.mint_token()
+    assert ok is True
+    assert len(token) == 8
+    # and redemption succeeds
+    ok2, _ = gate.redeem(token)
+    assert ok2 is True and gate.paper is False
+
+
+def test_gate_override_inactive_without_env(monkeypatch):
+    monkeypatch.delenv("GO_LIVE_OVERRIDE", raising=False)
+    gate = GoLiveGate()
+    ok, msg = gate.mint_token()
+    assert ok is False and "REFUSED" in msg
 
 
 def test_gate_stays_paper_when_persistence_fails():

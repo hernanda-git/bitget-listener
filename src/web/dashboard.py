@@ -140,6 +140,17 @@ def create_app(orchestrator, password: str | None = None) -> FastAPI:
         require_auth(x_dash_password, "to_paper")
         return {"message": orchestrator.gate.to_paper("dashboard")}
 
+    @app.post("/api/mint_go_live")
+    async def mint_go_live(x_dash_password: str | None = Header(None)):
+        """Mint a token into the RUNNING gate (separate from the --go-live CLI,
+        which mints in a throwaway process the live gate never sees)."""
+        require_auth(x_dash_password, "mint_go_live")
+        ok, msg = orchestrator.gate.mint_token()
+        if not ok:
+            log.error("go-live mint REFUSED via dashboard: %s", msg)
+            raise HTTPException(status_code=400, detail=msg)
+        return {"token": msg, "warning": "single-use, 5-min TTL; redeem via /api/live"}
+
     @app.post("/api/live")
     async def go_live(payload: dict = Body(...), x_dash_password: str | None = Header(None)):
         require_auth(x_dash_password, "go_live")
