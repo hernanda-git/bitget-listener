@@ -38,6 +38,7 @@ from src.domain.model import (
     Side,
 )
 from src.exchanges.bitget_auth import BitgetAuth
+from src.exchanges.rate_limit import RateLimitGate
 from src.interfaces.ports import ExchangeAdapter
 
 log = logging.getLogger(__name__)
@@ -84,7 +85,8 @@ class BitgetAdapter(ExchangeAdapter):
     def __init__(self, key: str = "", secret: str = "", passphrase: str = "",
                  product_type: str | None = None, base_url: str | None = None,
                  margin_coin: str = "USDT", client: httpx.AsyncClient | None = None,
-                 paper: bool = True, recv_window_ms: int = 5000) -> None:
+                 paper: bool = True, recv_window_ms: int = 5000,
+                 rate_limit: RateLimitGate | None = None) -> None:
         self.base_url = (base_url or os.getenv("BITGET_REST_BASE", "https://api.bitget.com")).rstrip("/")
         self.product_type = product_type or os.getenv("BITGET_PRODUCT_TYPE", "SUSDT-FUTURES")
         self.margin_coin = margin_coin if self.product_type == "USDT-FUTURES" else "SUSDT"
@@ -96,6 +98,8 @@ class BitgetAdapter(ExchangeAdapter):
         self._client = client
         self._owns_client = client is None
         self._spec_cache: dict[str, InstrumentSpec] = {}
+        # Rate-limit gate: throttles every outbound call + handles 429/ban risk.
+        self.rate_limit = rate_limit or RateLimitGate()
 
     # ------------------------------------------------------------------ plumbing
     @property
@@ -147,8 +151,10 @@ class BitgetAdapter(ExchangeAdapter):
         return "?" + "&".join(f"{k}={v}" for k, v in clean.items())
 
     async def _public(self, path: str, params: dict | None = None) -> Any:
+        await self.rate_limit.acquire("public")
         client = await self._http()
         r = await client.get(f"{self.base_url}{path}", params=params or {})
+        self.rate_limit.on_success()
         body = r.json()
         if body.get("code") != "00000":
             raise BitgetError(str(body.get("code")), str(body.get("msg")), path)
@@ -161,18 +167,32 @@ class BitgetAdapter(ExchangeAdapter):
             raise BitgetError("NO_CREDS",
                               "no Bitget API credentials configured (set BITGET_API_KEY/"
                               "SECRET/PASSPHRASE in .env)", path)
+        # Throttle by category: order endpoints are the strict 1/s path, account
+        # endpoints 5/s, everything else the 10/s signed default.
+        category = "order" if path == P_PLACE else (
+            "account" if path in (P_SET_LEVERAGE, P_ACCOUNTS) else "signed")
+        await self.rate_limit.acquire(category)
         request_path = path + self._qs(params or {})
         payload = json.dumps(body, separators=(",", ":")) if body else ""
         headers = self._auth.headers(method, request_path, payload)
         client = await self._http()
         r = await client.request(method.upper(), f"{self.base_url}{request_path}",
                                  content=payload or None, headers=headers)
+        if r.status_code == 429:
+            retry_after = None
+            try:
+                retry_after = float(r.headers.get("Retry-After", ""))
+            except (TypeError, ValueError):
+                pass
+            await self.rate_limit.on_429(retry_after)
+            raise BitgetError("429", "too frequent (rate limited)", path)
         try:
             data = r.json()
         except Exception:
             raise BitgetError(str(r.status_code), r.text[:200], path)
         if data.get("code") != "00000":
             raise BitgetError(str(data.get("code")), str(data.get("msg")), path)
+        self.rate_limit.on_success()
         return data.get("data")
 
     # ----------------------------------------------------------- instrument spec

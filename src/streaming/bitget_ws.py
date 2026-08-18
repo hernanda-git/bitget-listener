@@ -28,6 +28,7 @@ from typing import Awaitable, Callable
 import websockets
 
 from src.domain.model import Fill, Instrument, Position, Side
+from src.exchanges.rate_limit import RateLimitGate
 from src.interfaces.ports import MarketStream
 
 log = logging.getLogger(__name__)
@@ -44,7 +45,8 @@ class BitgetWS(MarketStream):
     def __init__(self, symbols: list[str] | None = None, auth=None,
                  product_type: str = "SUSDT-FUTURES", private: bool = False,
                  url: str | None = None, ping_interval: float = 25.0,
-                 max_backoff: float = 30.0, connector=None) -> None:
+                 max_backoff: float = 30.0, connector=None,
+                 rate_limit: RateLimitGate | None = None) -> None:
         self.symbols = [s.upper() for s in (symbols or [])]
         self.auth = auth
         self.product_type = product_type
@@ -53,6 +55,9 @@ class BitgetWS(MarketStream):
         self.ping_interval = ping_interval
         self.max_backoff = max_backoff
         self._connector = connector or websockets.connect
+        # WS message limiter: Bitget caps 10 msg/s per connection (ping+subscribe
+        # all count); we stay under with margin and never risk a disconnect/ban.
+        self.rate_limit = rate_limit or RateLimitGate()
 
         self._marks: dict[str, float] = {}
         self._task: asyncio.Task | None = None
@@ -162,11 +167,13 @@ class BitgetWS(MarketStream):
         async with self._connector(self.url, open_timeout=15) as ws:
             self._ws = ws
             if self.private:
+                await self.rate_limit.acquire("ws")
                 await ws.send(json.dumps(self.login_frame()))
                 raw = await asyncio.wait_for(ws.recv(), timeout=15)
                 resp = self._loads(raw)
                 if isinstance(resp, dict) and resp.get("event") == "error":
                     raise RuntimeError(f"WS login rejected: {resp}")
+            await self.rate_limit.acquire("ws")
             await ws.send(json.dumps(self.subscribe_frame()))
             self.connected = True
             self.last_msg_ts = time.time()
@@ -187,6 +194,7 @@ class BitgetWS(MarketStream):
         """Bitget wants the LITERAL string 'ping' (verified) — not a JSON frame."""
         while True:
             await asyncio.sleep(self.ping_interval)
+            await self.rate_limit.acquire("ws")
             await ws.send("ping")
 
     @staticmethod

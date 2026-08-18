@@ -56,12 +56,17 @@ def build_config() -> tuple[BotConfig, object]:
 
 async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
     product_type = cfg.params.get("product_type", "SUSDT-FUTURES")
+    # One shared rate-limit gate for REST + WS so a 429 on either surface trips
+    # the same ban-prevention breaker and the dashboard shows one source of truth.
+    from src.exchanges.rate_limit import RateLimitGate
+    rate_limit = RateLimitGate()
     adapter = BitgetAdapter(
         key=os.getenv("BITGET_API_KEY", ""),
         secret=os.getenv("BITGET_API_SECRET", ""),
         passphrase=os.getenv("BITGET_PASSPHRASE", ""),
         product_type=product_type,
         paper=cfg.paper,
+        rate_limit=rate_limit,
     )
     ledger = TradeLedger(os.getenv("LEDGER_PATH", "bitget_listener.db"))
     shadow = ShadowLedger(LedgerEvalStore(ledger),
@@ -79,7 +84,8 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
     else:
         source = TelethonSource(symbol_map=symbol_map)
 
-    stream = BitgetWS(symbols=sorted(whitelist), product_type=product_type)
+    stream = BitgetWS(symbols=sorted(whitelist), product_type=product_type,
+                     rate_limit=rate_limit)
     notifier = TelegramNotifier()
     limits = RiskLimits(
         risk_per_trade_usd=float(cfg.params.get("risk_per_trade_usd", 5.0)),
@@ -91,7 +97,7 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
     )
     orch = Orchestrator(source, adapter, gate, ledger, notifier=notifier, stream=stream,
                         shadow=shadow, limits=limits, symbol_map=symbol_map,
-                        whitelist=whitelist)
+                        whitelist=whitelist, rate_limit=rate_limit)
     orch.deadman = DeadManSwitch(stream, adapter, orch.positions, notifier,
                                  ttl_s=float(os.getenv("DEADMAN_TTL_S", "60")))
     return orch

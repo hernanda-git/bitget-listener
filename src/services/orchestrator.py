@@ -21,6 +21,7 @@ import time
 
 from src.domain.model import Instrument, Position, RawSignal, Side, Signal, TradeDecision
 from src.eval.shadow_ledger import ShadowLedger
+from src.exchanges.rate_limit import RateLimitGate
 from src.notifier.telegram import TelegramNotifier
 from src.services.order import OrderService
 from src.services.position import PositionManager
@@ -33,7 +34,8 @@ class Orchestrator:
     def __init__(self, source, adapter, gate, ledger, notifier=None, stream=None,
                  deadman=None, shadow: ShadowLedger | None = None,
                  limits: RiskLimits | None = None, symbol_map=None,
-                 whitelist: set[str] | None = None) -> None:
+                 whitelist: set[str] | None = None,
+                 rate_limit: RateLimitGate | None = None) -> None:
         self.source = source
         self.adapter = adapter
         self.gate = gate
@@ -48,6 +50,7 @@ class Orchestrator:
         self.sizer = FixedRiskSizer(self.limits)
         self.orders = OrderService(adapter, paper=gate.paper, sizer=self.sizer)
         self.positions = PositionManager(adapter, self.orders, ledger, stream)
+        self.rate_limit = rate_limit or RateLimitGate()
         self.open_trade_ids: dict[str, int] = {}
         self.daily_realized = 0.0
         self.skipped: list[dict] = []
@@ -94,6 +97,15 @@ class Orchestrator:
         """Single entry point for one inbound message."""
         if rs.is_management:
             return await self.handle_management(rs)
+
+        # Ban-prevention: if the rate-limit breaker is open (repeated 429s),
+        # refuse to place NEW orders and park silently rather than risk an IP ban.
+        if self.rate_limit.is_open():
+            reason = (f"rate-limit breaker open "
+                      f"({self.rate_limit.cooldown_remaining_s:.0f}s remaining)")
+            self.skipped.append({"symbol": rs.symbol_usdt, "reason": reason})
+            log.warning("skipping signal: %s", reason)
+            return {"status": "SKIPPED", "reason": reason}
 
         reason = self.guard(rs)
         if reason is not None:
@@ -316,6 +328,9 @@ class Orchestrator:
             "daily_realized": self.daily_realized,
             "deadman_halted": bool(self.deadman.halted) if self.deadman else False,
             "flagged_pairs": self.shadow.weak_pairs(),
+            "rate_limit_breaker_open": self.rate_limit.is_open(),
+            "rate_limit_cooldown_s": round(self.rate_limit.cooldown_remaining_s, 1),
+            "rate_limit_alerts": self.rate_limit.alerts[-5:],
             "skipped": self.skipped[-20:],
             "equity_history": self.ledger.equity_history(500),
         }
