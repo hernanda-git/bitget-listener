@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### Ops audit 2026-08-18 (Sera production review)
+- `requirements.txt` / `requirements-dev.txt` added. The production venv had no
+  `pytest-asyncio`, so the suite reported **93 failed / 221 passed** purely
+  because `pytest.ini` sets `asyncio_mode = auto` and the plugin was absent.
+  With it: **314 passed**. Re-verified from a clean venv built only from the new
+  manifests: **314 passed**.
+- Telegram notifier wired (`TG_BOT_TOKEN`, `TG_CHAT_ID`, `TG_OPERATOR_ID` in the
+  git-ignored `.env`). Before this the bot logged `[notifier:no-credentials]` and
+  dropped every alert. `scripts/verify_notifier.py` proves real delivery
+  (`send_returned: True`) and the operator gate (operator `True`,
+  stranger `False`).
+- `RUNBOOK.md` corrected: `WEB_ACTION_PASSWORD` -> `DASH_PASSWORD`,
+  `$WEB_PORT`/8080 -> `$PORT`/8092, plus the real nginx + systemd topology.
+
+#### NOT done, and why (no fabrication)
+- **Symbol whitelist was NOT widened.** `SYMBOL_WHITELIST=BTCUSDT,ETHUSDT,XRPUSDT`
+  is already the maximum. Live query of
+  `GET /api/v2/mix/market/contracts?productType=SUSDT-FUTURES` returns exactly
+  **3** contracts — `SBTCSUSDT`, `SETHSUSDT`, `SXRPSUSDT`. Signals such as
+  `SNDKUSDT` are therefore correctly skipped; adding them would create orders for
+  instruments the demo product does not list. Widening requires real keys and
+  `BITGET_PRODUCT_TYPE=USDT-FUTURES`, which remains a documented go-live blocker.
+
 ### P11 — demo symbol translation + paper-no-creds fixes (regression-pinned)
 - `src/exchanges/bitget.py` + `src/streaming/bitget_ws.py`: added
   `venue_symbol()` / `canonical_symbol()` so the demo product's `SBTCSUSDT`
