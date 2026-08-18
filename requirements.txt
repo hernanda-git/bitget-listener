@@ -1,0 +1,33 @@
+# bitget-listener — runtime dependencies (pinned to the versions running on Sera).
+# Install: .venv/bin/pip install -r requirements.txt
+# Test/dev extras live in requirements-dev.txt (pytest-asyncio is REQUIRED to run
+# the suite: without it every async test errors out with "async def not natively
+# supported" and the suite reports ~93 false failures).
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.14.2
+certifi==2026.7.22
+click==8.4.2
+fastapi==0.141.1
+greenlet==3.5.5
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.18
+psycopg==3.3.4
+pyaes==1.6.1
+pyasn1==0.6.4
+pydantic==2.13.4
+pydantic_core==2.46.4
+python-dotenv==1.2.3
+PyYAML==6.0.3
+rsa==4.9.1
+starlette==1.6.0
+Telethon==1.44.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+uvicorn==0.52.3
+uvloop==0.22.1
+watchfiles==1.2.0
+websockets==17.0.1

@@ -1,0 +1,17 @@
+# bitget-listener — test/dev dependencies.
+# Install: .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+#
+# pytest-asyncio is MANDATORY. pytest.ini sets `asyncio_mode = auto`; if the
+# plugin is missing pytest still collects the async tests but cannot run them,
+# producing 93 bogus failures out of 314 tests. Verified on Sera 2026-08-18:
+#   without pytest-asyncio -> 93 failed, 221 passed
+#   with    pytest-asyncio -> 314 passed
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+Pygments==2.21.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+# headless-Chromium dashboard UI verification (scripts/verify_ui*.py)
+playwright==1.62.0
+pyee==13.0.1
