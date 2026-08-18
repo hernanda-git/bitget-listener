@@ -100,6 +100,16 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
 async def cmd_run(args) -> int:
     cfg, store = build_config()
     orch = await build_runtime(cfg, store, use_fake_source=args.fake_source)
+
+    # Operator Telegram command poller (Bot API). Independent of the Telethon
+    # @fattyfatclub listener and of the notifier sender. Commands are gated by
+    # CommandRouter + GoLiveGate, so this can never flip to live on its own.
+    from src.notifier.telegram import CommandRouter
+    from src.notifier.bot_poller import poll_commands
+    router = CommandRouter(gate=orch.gate, position_manager=orch.positions,
+                          shadow_ledger=orch.shadow, ledger=orch.ledger)
+    poller_task = asyncio.create_task(poll_commands(router))
+
     log.warning("starting in %s mode (product_type=%s)",
                 "PAPER" if orch.gate.paper else "LIVE",
                 cfg.params.get("product_type"))
@@ -134,6 +144,8 @@ async def cmd_run(args) -> int:
         finally:
             await orch.stop()
     finally:
+        if 'poller_task' in locals() and poller_task is not None:
+            poller_task.cancel()
         lock.release()
     return 0
 
