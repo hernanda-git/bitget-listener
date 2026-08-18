@@ -322,10 +322,12 @@ class Orchestrator:
 
     def snapshot(self) -> dict:
         """State for the web dashboard / /status."""
+        from src.notifier import bot_poller
         nets = self.ledger.net_pnls()
         return {
             "mode": "PAPER" if self.gate.paper else "LIVE",
             "gate": self.gate.status(),
+            "tg_cmd_conflict": bool(bot_poller.tg_cmd_conflict),
             "positions": [
                 {"symbol": p.instrument.symbol, "side": p.side.value, "size": p.size,
                  "entry": p.entry_price, "sl": p.sl_price, "tp": p.tp_price,
