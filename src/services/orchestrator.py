@@ -17,9 +17,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 
-from src.domain.model import RawSignal, Signal, TradeDecision
+from src.domain.model import Instrument, Position, RawSignal, Side, Signal, TradeDecision
 from src.eval.shadow_ledger import ShadowLedger
+from src.notifier.telegram import TelegramNotifier
 from src.services.order import OrderService
 from src.services.position import PositionManager
 from src.services.risk import FixedRiskSizer, RiskLimits
@@ -81,7 +83,6 @@ class Orchestrator:
     def to_signal(self, rs: RawSignal) -> Signal | None:
         if not rs.symbol_usdt or rs.side not in ("BUY", "SELL"):
             return None
-        from src.domain.model import Instrument, Side
         inst = (self.symbol_map.resolve(rs.base or rs.symbol_usdt)
                 if self.symbol_map is not None else Instrument.from_token(rs.symbol_usdt))
         return Signal(instrument=inst, side=Side(rs.side), entry=rs.entry, sl=rs.sl,
@@ -129,31 +130,27 @@ class Orchestrator:
             sl_price=order.sl, tp_price=order.tp, paper=(status == "PAPER"),
             client_order_id=order.client_order_id, decision_id=str(signal.message_id or ""))
         self.open_trade_ids[order.instrument.symbol] = tid
-        # Paper mode must run with NO credentials, so it must never call a signed
+        # Paper mode runs with NO credentials, so it must never call a signed
         # endpoint. Track the position locally instead of syncing from the venue.
+        # On a sync failure we also keep the local view so the position is never lost.
         if status == "PAPER":
-            from src.domain.model import Position
-            self.positions.upsert(Position(
-                instrument=order.instrument, side=order.side, size=order.qty,
-                entry_price=order.price or signal.entry or 0.0,
-                leverage=order.leverage, sl_price=order.sl, tp_price=order.tp,
-                margin_mode=order.margin_mode))
+            self._local_position(order)
         else:
             try:
                 await self.positions.sync()
             except Exception as exc:
-                # A failed sync must not lose the position we just opened.
                 log.error("position sync failed after open (%s) — keeping local view", exc)
-                from src.domain.model import Position
-                self.positions.upsert(Position(
-                    instrument=order.instrument, side=order.side, size=order.qty,
-                    entry_price=order.price or signal.entry or 0.0,
-                    leverage=order.leverage, sl_price=order.sl, tp_price=order.tp,
-                    margin_mode=order.margin_mode))
+                self._local_position(order)
         if self.notifier is not None:
-            from src.notifier.telegram import TelegramNotifier
             with contextlib.suppress(Exception):
                 await self.notifier.send(TelegramNotifier.format_entry(result))
+
+    def _local_position(self, order) -> None:
+        self.positions.upsert(Position(
+            instrument=order.instrument, side=order.side, size=order.qty,
+            entry_price=order.price or 0.0,
+            leverage=order.leverage, sl_price=order.sl, tp_price=order.tp,
+            margin_mode=order.margin_mode))
 
     async def handle_management(self, rs: RawSignal) -> dict:
         """Deterministic management fast path — no LLM, milliseconds."""
@@ -197,7 +194,6 @@ class Orchestrator:
             mark = self.stream.mark_price(symbol)
         if mark is None:
             with contextlib.suppress(Exception):
-                from src.domain.model import Instrument
                 mark = await self.adapter.get_mark_price(Instrument.from_token(symbol))
         if mark is None:
             log.error("cannot book close for %s without a price — leaving trade open", symbol)
@@ -255,7 +251,6 @@ class Orchestrator:
     async def _equity_sampler(self) -> None:
         """Periodically append a wallet-equity sample so the dashboard can chart
         historical balance even when no trades are happening."""
-        import time as _t
         while self._running:
             try:
                 await asyncio.sleep(getattr(self, "equity_sample_sec", 60))
@@ -267,11 +262,10 @@ class Orchestrator:
 
     def _record_equity_sample(self) -> None:
         try:
-            import time as _t
             nets = self.ledger.net_pnls()
             equity = sum(nets)
             self.ledger.record_equity(
-                ts_ms=int(_t.time() * 1000),
+                ts_ms=int(time.time() * 1000),
                 equity_usd=equity,
                 fees_usd=self.ledger.total_fees(),
                 open_pos=len(self.positions.positions),

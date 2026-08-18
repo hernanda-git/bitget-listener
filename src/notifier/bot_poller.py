@@ -19,14 +19,11 @@ import asyncio
 import logging
 import os
 
-import httpx
-
-from src.notifier.telegram import CommandRouter
+from src.notifier.telegram import CommandRouter, get_client
 
 log = logging.getLogger(__name__)
 
 POLL_TIMEOUT_S = 25
-HTTP_TIMEOUT_S = POLL_TIMEOUT_S + 15
 
 
 async def poll_commands(router: CommandRouter, stop: asyncio.Event | None = None) -> None:
@@ -38,47 +35,47 @@ async def poll_commands(router: CommandRouter, stop: asyncio.Event | None = None
     base = f"https://api.telegram.org/bot{token}"
     offset = 0
     log.warning("[tg-cmd] command poller started (operator-gated)")
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-        while not (stop and stop.is_set()):
+    client = await get_client()
+    while not (stop and stop.is_set()):
+        try:
+            r = await client.get(
+                f"{base}/getUpdates",
+                params={"offset": offset, "timeout": POLL_TIMEOUT_S},
+            )
+            data = r.json()
+        except Exception as exc:  # network / TLS / timeout
+            log.error("[tg-cmd] getUpdates failed: %s", exc)
+            await asyncio.sleep(5)
+            continue
+
+        if not data.get("ok"):
+            log.error("[tg-cmd] getUpdates not ok: %s", data)
+            await asyncio.sleep(5)
+            continue
+
+        for upd in data.get("result", []):
+            offset = upd["update_id"] + 1
+            msg = upd.get("message") or upd.get("edited_message")
+            if not msg:
+                continue
+            text = msg.get("text", "")
+            sender = msg.get("from", {}).get("id")
+            if not text or not text.startswith("/"):
+                continue
             try:
-                r = await client.get(
-                    f"{base}/getUpdates",
-                    params={"offset": offset, "timeout": POLL_TIMEOUT_S},
-                )
-                data = r.json()
-            except Exception as exc:  # network / TLS / timeout
-                log.error("[tg-cmd] getUpdates failed: %s", exc)
-                await asyncio.sleep(5)
-                continue
-
-            if not data.get("ok"):
-                log.error("[tg-cmd] getUpdates not ok: %s", data)
-                await asyncio.sleep(5)
-                continue
-
-            for upd in data.get("result", []):
-                offset = upd["update_id"] + 1
-                msg = upd.get("message") or upd.get("edited_message")
-                if not msg:
-                    continue
-                text = msg.get("text", "")
-                sender = msg.get("from", {}).get("id")
-                if not text or not text.startswith("/"):
-                    continue
+                reply = await router.handle(text, sender)
+            except Exception:  # never let a bad command kill the poller
+                log.exception("[tg-cmd] handler error for %r", text)
+                reply = "internal error handling command"
+            if reply:
+                chat_id = msg.get("chat", {}).get("id")
                 try:
-                    reply = await router.handle(text, sender)
-                except Exception:  # never let a bad command kill the poller
-                    log.exception("[tg-cmd] handler error for %r", text)
-                    reply = "internal error handling command"
-                if reply:
-                    chat_id = msg.get("chat", {}).get("id")
-                    try:
-                        await client.post(
-                            f"{base}/sendMessage",
-                            json={"chat_id": chat_id, "text": reply, "parse_mode": "HTML"},
-                        )
-                    except Exception as exc:
-                        log.error("[tg-cmd] reply send failed: %s", exc)
+                    await client.post(
+                        f"{base}/sendMessage",
+                        json={"chat_id": chat_id, "text": reply, "parse_mode": "HTML"},
+                    )
+                except Exception as exc:
+                    log.error("[tg-cmd] reply send failed: %s", exc)
 
-            if stop and stop.is_set():
-                break
+        if stop and stop.is_set():
+            break

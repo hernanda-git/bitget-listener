@@ -6,6 +6,11 @@ delegates to the services, so the router itself holds no trading logic.
 
 Authorization: only ``TG_OPERATOR_ID`` may run state-changing commands, and
 ``/live`` additionally requires a gate token.
+
+A single module-level httpx client is shared by the notifier and the command
+poller, so we never open a new TLS connection per outgoing message. The notifier
+also supports an async context manager (``async with TelegramNotifier() as n``)
+for callers that want explicit lifecycle control.
 """
 
 from __future__ import annotations
@@ -15,9 +20,27 @@ import os
 
 import httpx
 
+from src.domain.model import Instrument, Position
 from src.interfaces.ports import Notifier
 
 log = logging.getLogger(__name__)
+
+# Shared, lazily-created client. Reused across alerts and the command poller.
+_CLIENT: httpx.AsyncClient | None = None
+
+
+async def get_client() -> httpx.AsyncClient:
+    global _CLIENT
+    if _CLIENT is None or _CLIENT.is_closed:
+        _CLIENT = httpx.AsyncClient(timeout=15)
+    return _CLIENT
+
+
+async def close_client() -> None:
+    global _CLIENT
+    if _CLIENT is not None and not _CLIENT.is_closed:
+        await _CLIENT.aclose()
+    _CLIENT = None
 
 
 class TelegramNotifier(Notifier):
@@ -25,15 +48,28 @@ class TelegramNotifier(Notifier):
                  client: httpx.AsyncClient | None = None) -> None:
         self.token = token or os.getenv("TG_BOT_TOKEN", "")
         self.chat_id = chat_id or os.getenv("TG_CHAT_ID", "")
+        # Owned client (when no client is injected) is closed on aclose()/exit.
         self._client = client
+        self._owns_client = client is None
         self.sent: list[str] = []
+
+    async def __aenter__(self) -> "TelegramNotifier":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        if self._owns_client and self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     async def send(self, text: str) -> bool:
         self.sent.append(text)
         if not self.token or not self.chat_id:
             log.info("[notifier:no-credentials] %s", text)
             return False
-        client = self._client or httpx.AsyncClient(timeout=15)
+        client = self._client or await get_client()
         try:
             r = await client.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
@@ -44,8 +80,8 @@ class TelegramNotifier(Notifier):
             log.error("notifier send failed: %s", exc)
             return False
         finally:
-            if self._client is None:
-                await client.aclose()
+            if self._owns_client:
+                await self.aclose()
 
     # ------------------------------------------------------------------ messages
     @staticmethod
@@ -105,20 +141,25 @@ class CommandRouter:
             ok, msg = self.gate.redeem(args[0])
             return msg
         if cmd == "/close":
-            if not args:
-                return "usage: /close <SYMBOL>"
-            res = await self.positions.full_close(args[0].upper(), reason="telegram")
-            return f"{args[0].upper()}: {res.get('status')}"
+            return await self._close(args)
         if cmd == "/sl_to_entry":
             if not args:
                 return "usage: /sl_to_entry <SYMBOL>"
             return str(await self.positions.sl_to_entry(args[0].upper()))
         return f"unknown command: {cmd}"
 
+    async def _close(self, args: list[str]) -> str:
+        if not args:
+            return "usage: /close <SYMBOL>"
+        sym = args[0].upper()
+        res = await self.positions.full_close(sym, reason="telegram")
+        return f"{sym}: {res.get('status')}"
+
     async def _read_only(self, cmd: str) -> str:
         if cmd == "/status":
             st = self.gate.status()
-            lines = [f"mode: {st['mode']}", f"open positions: {len(self.positions.positions)}"]
+            lines = [f"mode: {st['mode']}",
+                     f"open positions: {len(self.positions.positions)}"]
             if self.ledger is not None:
                 nets = self.ledger.net_pnls()
                 lines.append(f"closed trades: {len(nets)}  net: {sum(nets):+.4f} USDT")

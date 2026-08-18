@@ -146,6 +146,9 @@ async def cmd_run(args) -> int:
     finally:
         if 'poller_task' in locals() and poller_task is not None:
             poller_task.cancel()
+        # Release the shared Telegram httpx client so the process exits clean.
+        from src.notifier.telegram import close_client
+        await close_client()
         lock.release()
     return 0
 
