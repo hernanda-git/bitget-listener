@@ -79,6 +79,19 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
         "SYMBOL_WHITELIST", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip()}
     symbol_map = SymbolMap(whitelist)
 
+    # Private WS (fills + live positions/liq-price) is the contract-correct path
+    # for those events — Bitget pushes them over the authenticated channel rather
+    # than making us poll REST get_fills/get_positions on a loop. Built only when
+    # real credentials exist; in paper/demo there is no private stream.
+    _bk, _bs, _bp = (os.getenv("BITGET_API_KEY", ""), os.getenv("BITGET_API_SECRET", ""),
+                     os.getenv("BITGET_PASSPHRASE", ""))
+    private_stream = None
+    if _bk and _bs and _bp:
+        from src.exchanges.bitget_auth import BitgetAuth
+        private_stream = BitgetWS(
+            symbols=sorted(whitelist), product_type=product_type,
+            auth=BitgetAuth(_bk, _bs, _bp), private=True, rate_limit=rate_limit)
+
     if use_fake_source:
         source = FakeSignalSource([], symbol_map=symbol_map)
     else:
@@ -97,7 +110,8 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
     )
     orch = Orchestrator(source, adapter, gate, ledger, notifier=notifier, stream=stream,
                         shadow=shadow, limits=limits, symbol_map=symbol_map,
-                        whitelist=whitelist, rate_limit=rate_limit)
+                        whitelist=whitelist, rate_limit=rate_limit,
+                        private_stream=private_stream)
     orch.deadman = DeadManSwitch(stream, adapter, orch.positions, notifier,
                                  ttl_s=float(os.getenv("DEADMAN_TTL_S", "60")))
     return orch

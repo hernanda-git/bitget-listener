@@ -35,7 +35,8 @@ class Orchestrator:
                  deadman=None, shadow: ShadowLedger | None = None,
                  limits: RiskLimits | None = None, symbol_map=None,
                  whitelist: set[str] | None = None,
-                 rate_limit: RateLimitGate | None = None) -> None:
+                 rate_limit: RateLimitGate | None = None,
+                 private_stream=None) -> None:
         self.source = source
         self.adapter = adapter
         self.gate = gate
@@ -51,6 +52,7 @@ class Orchestrator:
         self.orders = OrderService(adapter, paper=gate.paper, sizer=self.sizer)
         self.positions = PositionManager(adapter, self.orders, ledger, stream)
         self.rate_limit = rate_limit or RateLimitGate()
+        self.private_stream = private_stream  # BitgetWS(private=True) when creds exist
         self.open_trade_ids: dict[str, int] = {}
         self.daily_realized = 0.0
         self.skipped: list[dict] = []
@@ -254,6 +256,13 @@ class Orchestrator:
             self.stream.on_position = self.on_position
             self.stream.on_tick = lambda s, p: asyncio.create_task(self.on_tick(s, p))
             await self.stream.start()
+        # Private WS carries fills (go-live observe_fill + BUG A fee tripwire) and
+        # live position/liq-price updates — the contract-correct, low-rate path
+        # vs polling REST get_fills/get_positions on a loop.
+        if self.private_stream is not None:
+            self.private_stream.on_fill = self.on_fill
+            self.private_stream.on_position = self.on_position
+            await self.private_stream.start()
         if self.deadman is not None:
             await self.deadman.start()
         self._running = True
@@ -306,7 +315,7 @@ class Orchestrator:
                 tk.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await tk
-        for comp in (self.deadman, self.stream, self.source):
+        for comp in (self.deadman, self.stream, self.private_stream, self.source):
             if comp is not None:
                 with contextlib.suppress(Exception):
                     await comp.stop()
