@@ -144,7 +144,7 @@ class OrderRequest:
     sl: float | None = None              # attached preset SL
     tp: float | None = None              # attached preset TP
     leverage: int = 1
-    margin_mode: Literal["isolated", "crossed"] = "isolated"
+    margin_mode: Literal["isolated", "crossed"] | str = "isolated"
     client_order_id: str | None = None   # clientOid, idempotency key
     decision_id: str | None = None       # links order -> decision for dedup
 

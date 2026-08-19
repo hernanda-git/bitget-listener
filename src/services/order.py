@@ -133,6 +133,7 @@ class OrderService:
             instrument=position.instrument, side=position.side.opposite,
             order_type="market", qty=BitgetAdapter.round_qty(spec, qty, position.entry_price),
             reduce_only=True, leverage=position.leverage,
+            margin_mode=position.margin_mode,
             client_order_id=BitgetAdapter.new_client_oid("bgc"),
         )
         if self.paper:

@@ -110,21 +110,21 @@ class CommandRouter:
     # Single source of truth for the menu, /help and the BotFather registration.
     # (command, args, description, state_changing, group)
     COMMANDS: list[tuple[str, str, str, bool, str]] = [
-        ("status", "", "position, PnL and mode overview", False, "Monitor"),
-        ("positions", "", "open positions with live PnL", False, "Monitor"),
-        ("pnl", "", "unrealized, daily and lifetime PnL", False, "Monitor"),
-        ("balance", "", "wallet, margin and equity", False, "Monitor"),
-        ("activity", "[n]", "recent closed trades", False, "Monitor"),
-        ("health", "", "system liveness and safety rails", False, "Monitor"),
-        ("pairs", "", "pairs flagged weak by the shadow ledger", False, "Monitor"),
-        ("open", "<SYM> <BUY|SELL> <sl> [tp] [usd]",
+        ("bitget_status", "", "position, PnL and mode overview", False, "Monitor"),
+        ("bitget_positions", "", "open positions with live PnL", False, "Monitor"),
+        ("bitget_pnl", "", "unrealized, daily and lifetime PnL", False, "Monitor"),
+        ("bitget_balance", "", "wallet, margin and equity", False, "Monitor"),
+        ("bitget_activity", "[n]", "recent closed trades", False, "Monitor"),
+        ("bitget_health", "", "system liveness and safety rails", False, "Monitor"),
+        ("bitget_pairs", "", "pairs flagged weak by the shadow ledger", False, "Monitor"),
+        ("bitget_open", "<SYM> <BUY|SELL> <sl> [tp] [usd]",
          "open a position manually", True, "Trade"),
-        ("close", "<SYM|all>", "market-close a position", True, "Trade"),
-        ("sl_to_entry", "<SYM>", "move stop-loss to break-even", True, "Trade"),
-        ("toggle", "", "switch between paper and live", True, "Control"),
-        ("paper", "", "return to paper mode immediately", True, "Control"),
-        ("live", "<token>", "redeem a go-live token", True, "Control"),
-        ("help", "", "show this menu", False, "Monitor"),
+        ("bitget_close", "<SYM|all>", "market-close a position", True, "Trade"),
+        ("bitget_sl_to_entry", "<SYM>", "move stop-loss to break-even", True, "Trade"),
+        ("bitget_toggle", "", "switch between paper and live", True, "Control"),
+        ("bitget_paper", "", "return to paper mode immediately", True, "Control"),
+        ("bitget_live", "<token>", "redeem a go-live token", True, "Control"),
+        ("bitget_help", "", "show this menu", False, "Monitor"),
     ]
 
     # Order the groups appear in the menu.
@@ -177,54 +177,63 @@ class CommandRouter:
         # Telegram sends "/cmd@botname" in groups — strip the mention.
         if "@" in cmd:
             cmd = cmd.split("@", 1)[0]
+        # A bare "/" lists the menu. Then strip the bitget_ namespace.
+        if cmd == "/":
+            return self.help_text(self.authorized(sender_id))
+        if cmd == "/bitget":
+            return self.help_text(self.authorized(sender_id))
+        if cmd.startswith("/bitget_"):
+            action = cmd[len("/bitget_"):]
+        else:
+            action = cmd.lstrip("/")
 
-        # A bare "/" (or /help, /start, /commands) lists everything.
-        if cmd in ("/", "/help", "/start", "/commands", "/menu"):
+        # A bare "/" (or /help, /start, /commands, /menu, /bitget_help) lists everything.
+        if action in ("/", "help", "start", "commands", "menu"):
             return self.help_text(self.authorized(sender_id))
 
-        if cmd in ("/status", "/positions", "/pairs", "/health",
-                   "/balance", "/pnl", "/activity"):     # read-only, open
-            return await self._read_only(cmd, args)
+        if action in ("status", "positions", "pairs", "health",
+                      "balance", "pnl", "activity"):     # read-only, open
+            return await self._read_only("/" + action, args)
 
         if not self.authorized(sender_id):
             return fmt.join(
                 fmt.title("Not authorized", "🔒"),
                 fmt.hint("Trading commands are limited to the configured operator. "
-                         "Monitoring commands are open — try /status."))
+                         "Monitoring commands are open — try /bitget_status."))
 
-        if cmd == "/toggle":
+        if action == "toggle":
             return fmt.join(fmt.title("Mode change", "🔐"),
                             str(self.gate.toggle("telegram")))
-        if cmd == "/paper":
+        if action == "paper":
             return fmt.join(fmt.title("Paper mode", "🧪"),
                             str(self.gate.to_paper("telegram")))
-        if cmd == "/live":
+        if action == "live":
             if not args:
                 return fmt.join(fmt.title("Go live", "🔐"),
-                                fmt.row("Usage", "/live <token>"),
+                                fmt.row("Usage", "/bitget_live <token>"),
                                 fmt.hint("Mint a token first, then redeem it here."))
             ok, msg = self.gate.redeem(args[0])
             return fmt.join(fmt.title("Go live" if ok else "Rejected",
                                       "✅" if ok else "⚠️"), str(msg))
-        if cmd == "/close":
+        if action == "close":
             return await self._close(args)
-        if cmd == "/open":
+        if action == "open":
             return await self._open(args)
-        if cmd == "/sl_to_entry":
+        if action == "sl_to_entry":
             if not args:
                 return fmt.join(fmt.title("Move stop to entry", "⚡"),
-                                fmt.row("Usage", "/sl_to_entry <SYMBOL>"))
+                                fmt.row("Usage", "/bitget_sl_to_entry <SYMBOL>"))
             res = await self.positions.sl_to_entry(args[0].upper())
             return fmt.join(fmt.title("Stop moved to entry", "⚡"), str(res))
         return fmt.join(fmt.title("Unknown command", "❔"),
                         fmt.plain_row("Received", f"<code>{cmd}</code>"),
-                        fmt.hint("Send /help to see everything available."))
+                        fmt.hint("Send /bitget_help to see everything available."))
 
     async def _close(self, args: list[str]) -> str:
         if not args:
             return fmt.join(fmt.title("Close a position", "⚡"),
-                            fmt.row("Usage", "/close <SYMBOL>"),
-                            fmt.row("Or", "/close all"))
+                            fmt.row("Usage", "/bitget_close <SYMBOL>"),
+                            fmt.row("Or", "/bitget_close all"))
         target = args[0].upper()
         if target == "ALL":
             syms = list(self.positions.positions.keys())
@@ -253,8 +262,8 @@ class CommandRouter:
         """Manual entry. SL is MANDATORY — the sizer refuses an entry without one."""
         usage = fmt.join(
             fmt.title("Open a position", "⚡"),
-            fmt.lines(fmt.row("Usage", "/open <SYMBOL> <BUY|SELL> <sl> [tp] [usd]"),
-                      fmt.row("Example", "/open XRPUSDT BUY 2.10")),
+            fmt.lines(fmt.row("Usage", "/bitget_open <SYMBOL> <BUY|SELL> <sl> [tp] [usd]"),
+                      fmt.row("Example", "/bitget_open XRPUSDT BUY 2.10")),
             fmt.hint("A stop-loss is mandatory — the bot refuses any entry "
                      "without one."))
         if len(args) < 3:

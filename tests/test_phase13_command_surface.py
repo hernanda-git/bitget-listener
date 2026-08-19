@@ -1,4 +1,4 @@
-"""P13: the operator command surface — menu, read-only reports, manual open/close.
+"""P13: the operator command surface — menu, read-only reports, manual open/bitget_close.
 
 Zero network. Every command is exercised against fakes so the reply text and the
 authorization boundary are pinned. The bot runs on REAL money, so the tests that
@@ -108,50 +108,58 @@ async def test_bare_slash_lists_every_command():
         assert f"/{name}" in out, f"{name} missing from the menu"
 
 
-@pytest.mark.parametrize("alias", ["/help", "/start", "/commands", "/menu"])
+@pytest.mark.parametrize("alias", ["/bitget_help", "/bitget_start", "/bitget_commands", "/bitget_menu"])
 async def test_help_aliases_all_show_the_menu(alias):
     out = await _router().handle(alias, OPERATOR)
-    assert "/positions" in out and "/close" in out
+    assert "/bitget_positions" in out and "/bitget_close" in out
 
 
 async def test_menu_separates_readonly_from_operator_commands():
-    out = await _router().handle("/help", OPERATOR)
+    out = await _router().handle("/bitget_help", OPERATOR)
     for group in ("Monitor", "Trade", "Control"):
         assert group in out
 
 
 async def test_menu_warns_a_non_operator():
-    out = await _router().handle("/help", STRANGER)
+    out = await _router().handle("/bitget_help", STRANGER)
     assert "not the configured operator" in out.lower() or "not the configured" in out
 
 
 async def test_group_style_mention_is_stripped():
-    """Telegram sends '/status@mybot' in groups."""
-    out = await _router().handle("/status@nibiru_valarion_bot", OPERATOR)
+    """Telegram sends '/bitget_status@mybot' in groups."""
+    out = await _router().handle("/bitget_status@nibiru_valarion_bot", OPERATOR)
     assert "LIVE" in out and "Status" in out
 
 
+
+async def test_legacy_command_names_still_dispatch():
+    """Migration safety: old /close etc. still route while the menu is bitget_*."""
+    pm = _Positions({"XRPUSDT": _pos()}, adapter=_Adapter())
+    out = await _router(positions=pm).handle("/close all", OPERATOR)
+    assert {s for s, _ in pm.closed} == {"XRPUSDT"}
+    assert "CLOSED" in out
+
 async def test_unknown_command_points_at_help():
-    out = await _router().handle("/frobnicate", OPERATOR)
-    assert "Unknown command" in out and "/help" in out
+    out = await _router().handle("/bitget_frobnicate", OPERATOR)
+    assert "Unknown command" in out and "/bitget_help" in out
 
 
 # --------------------------------------------------------------------- read-only
 async def test_balance_reports_available_and_product():
-    out = await _router().handle("/balance", OPERATOR)
+    out = await _router().handle("/bitget_balance", OPERATOR)
     assert "8.8799" in out and "USDT-FUTURES" in out
 
 
 async def test_balance_degrades_gracefully_when_the_venue_errors():
     r = _router(adapter=_Adapter(fail_balance=True))
     r.positions.adapter = _Adapter(fail_balance=True)
-    out = await r.handle("/balance", OPERATOR)
+    out = await r.handle("/bitget_balance", OPERATOR)
     assert "Balance unavailable" in out and "NO_CREDS" in out
 
 
 async def test_positions_shows_unrealized_pnl_and_liquidation():
     pm = _Positions({"XRPUSDT": _pos(upnl=0.25)}, adapter=_Adapter())
-    out = await _router(positions=pm).handle("/positions", OPERATOR)
+    out = await _router(positions=pm).handle("/bitget_positions", OPERATOR)
     assert "XRPUSDT" in out and "+0.2500" in out and "1.5" in out
 
 
@@ -159,14 +167,14 @@ async def test_positions_derives_upnl_from_mark_when_venue_reports_none():
     """entry 2.0, mark 2.1, size 2 BUY -> +0.20. Never fabricated: derived."""
     pm = _Positions({"XRPUSDT": _pos(entry=2.0, size=2.0, upnl=0.0)},
                     adapter=_Adapter(mark=2.1))
-    out = await _router(positions=pm).handle("/positions", OPERATOR)
+    out = await _router(positions=pm).handle("/bitget_positions", OPERATOR)
     assert "+0.2000" in out
 
 
 async def test_positions_never_prints_a_fake_zero_liquidation():
     """BUG B: liq must read n/a when absent, never 0.00."""
     pm = _Positions({"XRPUSDT": _pos(liq=None)}, adapter=_Adapter())
-    out = await _router(positions=pm).handle("/positions", OPERATOR)
+    out = await _router(positions=pm).handle("/bitget_positions", OPERATOR)
     assert fmt.DASH in out and "0.00" not in out.replace("+0.0000", "")
 
 
@@ -176,7 +184,7 @@ async def test_positions_percentage_never_contradicts_the_pnl_sign():
                      "DOGEUSDT": _pos("DOGEUSDT", side=Side.SELL, entry=0.20841,
                                       size=240.0, upnl=-0.1128)},
                     adapter=_Adapter(mark=1.0))
-    out = await _router(positions=pm).handle("/positions", OPERATOR)
+    out = await _router(positions=pm).handle("/bitget_positions", OPERATOR)
     for card in out.split("🟢")[1:] + out.split("🔴")[1:]:
         line = [ln for ln in card.splitlines() if "PnL" in ln]
         if not line:
@@ -191,12 +199,12 @@ async def test_positions_percentage_is_return_on_notional():
     """+0.3417 on 17 x 2.8412 = 48.30 notional -> +0.71%."""
     pm = _Positions({"XRPUSDT": _pos(entry=2.8412, size=17.0, upnl=0.3417)},
                     adapter=_Adapter(mark=2.86))
-    out = await _router(positions=pm).handle("/positions", OPERATOR)
+    out = await _router(positions=pm).handle("/bitget_positions", OPERATOR)
     assert "+0.71%" in out
 
 
 async def test_positions_empty():
-    assert "No open positions" in await _router().handle("/positions", OPERATOR)
+    assert "No open positions" in await _router().handle("/bitget_positions", OPERATOR)
 
 
 async def test_pnl_reports_unrealized_daily_and_lifetime():
@@ -204,7 +212,7 @@ async def test_pnl_reports_unrealized_daily_and_lifetime():
                    {"net_usd": -0.5, "fees_usd": 0.01}])
     pm = _Positions({"XRPUSDT": _pos(upnl=0.25)}, adapter=_Adapter())
     r = _router(positions=pm, ledger=led, orch=_orch(daily=-0.5))
-    out = await r.handle("/pnl", OPERATOR)
+    out = await r.handle("/bitget_pnl", OPERATOR)
     assert "+0.2500" in out            # unrealized
     assert "-0.5000" in out            # daily realized
     assert "+1.0000" in out            # lifetime net
@@ -214,33 +222,33 @@ async def test_pnl_reports_unrealized_daily_and_lifetime():
 async def test_pnl_flags_a_breached_daily_cap():
     orch = _orch(daily=-3.0)
     orch.daily_loss_breached = lambda: True
-    out = await _router(ledger=_Ledger(), orch=orch).handle("/pnl", OPERATOR)
+    out = await _router(ledger=_Ledger(), orch=orch).handle("/bitget_pnl", OPERATOR)
     assert "Daily loss cap reached" in out
 
 
 async def test_activity_lists_recent_trades_newest_first():
     led = _Ledger([{"symbol": "ADAUSDT", "net_usd": -0.2, "fees_usd": 0.01},
                    {"symbol": "XRPUSDT", "net_usd": 1.0, "fees_usd": 0.02}])
-    out = await _router(ledger=led).handle("/activity", OPERATOR)
+    out = await _router(ledger=led).handle("/bitget_activity", OPERATOR)
     assert out.index("XRPUSDT") < out.index("ADAUSDT")
     assert "🟢" in out and "🔴" in out
 
 
 async def test_activity_respects_a_count_argument():
     led = _Ledger([{"symbol": f"C{i}USDT", "net_usd": 0.1} for i in range(10)])
-    out = await _router(ledger=led).handle("/activity 3", OPERATOR)
+    out = await _router(ledger=led).handle("/bitget_activity 3", OPERATOR)
     assert "Recent activity" in out and "3" in out
 
 
 async def test_activity_empty_ledger():
     assert "No closed trades" in await _router(ledger=_Ledger()).handle(
-        "/activity", OPERATOR)
+        "/bitget_activity", OPERATOR)
 
 
 async def test_health_reports_all_four_liveness_signals():
     bot_poller.tg_cmd_conflict = False
     bot_poller.tg_cmd_consecutive_errors = 0
-    out = await _router(orch=_orch()).handle("/health", OPERATOR)
+    out = await _router(orch=_orch()).handle("/bitget_health", OPERATOR)
     assert "Healthy" in out
     for field in ("Mode", "Trading", "Rate limit", "Commands"):
         assert field in out
@@ -249,7 +257,7 @@ async def test_health_reports_all_four_liveness_signals():
 async def test_health_turns_degraded_when_the_command_channel_is_down():
     bot_poller.tg_cmd_conflict = True
     try:
-        out = await _router(orch=_orch()).handle("/health", OPERATOR)
+        out = await _router(orch=_orch()).handle("/bitget_health", OPERATOR)
         assert "Degraded" in out
     finally:
         bot_poller.tg_cmd_conflict = False
@@ -257,22 +265,22 @@ async def test_health_turns_degraded_when_the_command_channel_is_down():
 
 async def test_status_includes_daily_realized():
     out = await _router(ledger=_Ledger(), orch=_orch(daily=-1.25)).handle(
-        "/status", OPERATOR)
+        "/bitget_status", OPERATOR)
     assert "-1.2500" in out
 
 
 # ------------------------------------------------------- authorization boundary
 @pytest.mark.parametrize("cmd", [
-    "/open XRPUSDT BUY 1.9", "/close XRPUSDT", "/close all",
-    "/toggle", "/paper", "/live tok", "/sl_to_entry XRPUSDT",
+    "/bitget_open XRPUSDT BUY 1.9", "/bitget_close XRPUSDT", "/bitget_close all",
+    "/bitget_toggle", "/bitget_paper", "/bitget_live tok", "/bitget_sl_to_entry XRPUSDT",
 ])
 async def test_state_changing_commands_refuse_a_stranger(cmd):
     out = await _router(orch=_orch()).handle(cmd, STRANGER)
     assert "Not authorized" in out
 
 
-@pytest.mark.parametrize("cmd", ["/status", "/health", "/balance", "/positions",
-                                 "/pnl", "/activity", "/pairs", "/help"])
+@pytest.mark.parametrize("cmd", ["/bitget_status", "/bitget_health", "/bitget_balance", "/bitget_positions",
+                                 "/bitget_pnl", "/bitget_activity", "/bitget_pairs", "/bitget_help"])
 async def test_read_only_commands_are_open(cmd):
     out = await _router(ledger=_Ledger(), orch=_orch()).handle(cmd, STRANGER)
     assert "Not authorized" not in out
@@ -289,19 +297,19 @@ async def test_router_fails_closed_with_no_operator_configured(monkeypatch):
 async def test_close_all_closes_every_open_position():
     pm = _Positions({"XRPUSDT": _pos(), "ADAUSDT": _pos("ADAUSDT")},
                     adapter=_Adapter())
-    out = await _router(positions=pm).handle("/close all", OPERATOR)
+    out = await _router(positions=pm).handle("/bitget_close all", OPERATOR)
     assert {s for s, _ in pm.closed} == {"XRPUSDT", "ADAUSDT"}
     assert out.count("CLOSED") == 2 and "2/2" in out
 
 
 async def test_close_all_with_nothing_open():
-    out = await _router().handle("/close all", OPERATOR)
+    out = await _router().handle("/bitget_close all", OPERATOR)
     assert "Nothing to close" in out
 
 
 async def test_close_one_symbol():
     pm = _Positions({"XRPUSDT": _pos()}, adapter=_Adapter())
-    out = await _router(positions=pm).handle("/close xrpusdt", OPERATOR)
+    out = await _router(positions=pm).handle("/bitget_close xrpusdt", OPERATOR)
     assert pm.closed == [("XRPUSDT", "telegram")]
     assert "CLOSED" in out
 
@@ -316,7 +324,7 @@ async def test_close_reports_a_failure_without_aborting_the_rest():
         return {"status": "CLOSED"}
 
     pm.full_close = flaky
-    out = await _router(positions=pm).handle("/close all", OPERATOR)
+    out = await _router(positions=pm).handle("/bitget_close all", OPERATOR)
     assert "venue rejected" in out and "1/2" in out
     assert "CLOSED" in out          # the second one still went through
 
@@ -336,7 +344,7 @@ async def test_open_places_an_order_with_the_parsed_arguments():
     orders = _Orders()
     r = _router(orch=_orch(orders=orders), adapter=_Adapter(mark=2.1))
     r.positions.adapter = _Adapter(mark=2.1)
-    out = await r.handle("/open XRPUSDT BUY 1.90 2.50 6", OPERATOR)
+    out = await r.handle("/bitget_open XRPUSDT BUY 1.90 2.50 6", OPERATOR)
     assert len(orders.calls) == 1
     sig = orders.calls[0]
     assert sig.instrument.symbol == "XRPUSDT"
@@ -351,7 +359,7 @@ async def test_open_defaults_notional_to_the_configured_risk():
     orders = _Orders()
     r = _router(orch=_orch(params={"risk_per_trade_usd": 5.0}, orders=orders))
     r.positions.adapter = _Adapter(mark=2.1)
-    await r.handle("/open XRPUSDT BUY 1.90", OPERATOR)
+    await r.handle("/bitget_open XRPUSDT BUY 1.90", OPERATOR)
     assert orders.calls[0].notional_usd == 5.0
 
 
@@ -359,14 +367,14 @@ async def test_open_appends_usdt_to_a_bare_token():
     orders = _Orders()
     r = _router(orch=_orch(orders=orders))
     r.positions.adapter = _Adapter(mark=2.1)
-    await r.handle("/open xrp BUY 1.90", OPERATOR)
+    await r.handle("/bitget_open xrp BUY 1.90", OPERATOR)
     assert orders.calls[0].instrument.symbol == "XRPUSDT"
 
 
 async def test_open_without_a_stop_loss_shows_usage_and_places_nothing():
     orders = _Orders()
     r = _router(orch=_orch(orders=orders))
-    out = await r.handle("/open XRPUSDT BUY", OPERATOR)
+    out = await r.handle("/bitget_open XRPUSDT BUY", OPERATOR)
     assert "Usage" in out and "mandatory" in out
     assert orders.calls == []
 
@@ -376,7 +384,7 @@ async def test_open_refuses_a_buy_stop_above_the_mark():
     orders = _Orders()
     r = _router(orch=_orch(orders=orders))
     r.positions.adapter = _Adapter(mark=2.0)
-    out = await r.handle("/open XRPUSDT BUY 2.50", OPERATOR)
+    out = await r.handle("/bitget_open XRPUSDT BUY 2.50", OPERATOR)
     assert "Entry refused" in out
     assert orders.calls == []
 
@@ -385,7 +393,7 @@ async def test_open_refuses_a_sell_stop_below_the_mark():
     orders = _Orders()
     r = _router(orch=_orch(orders=orders))
     r.positions.adapter = _Adapter(mark=2.0)
-    out = await r.handle("/open XRPUSDT SELL 1.50", OPERATOR)
+    out = await r.handle("/bitget_open XRPUSDT SELL 1.50", OPERATOR)
     assert "Entry refused" in out
     assert orders.calls == []
 
@@ -394,19 +402,19 @@ async def test_open_accepts_long_short_aliases():
     orders = _Orders()
     r = _router(orch=_orch(orders=orders))
     r.positions.adapter = _Adapter(mark=2.0)
-    await r.handle("/open XRPUSDT SHORT 2.50", OPERATOR)
+    await r.handle("/bitget_open XRPUSDT SHORT 2.50", OPERATOR)
     assert orders.calls[0].side is Side.SELL
 
 
 async def test_open_rejects_a_bad_side():
     out = await _router(orch=_orch(orders=_Orders())).handle(
-        "/open XRPUSDT SIDEWAYS 1.9", OPERATOR)
+        "/bitget_open XRPUSDT SIDEWAYS 1.9", OPERATOR)
     assert "Invalid side" in out
 
 
 async def test_open_rejects_non_numeric_prices():
     r = _router(orch=_orch(orders=_Orders()))
-    out = await r.handle("/open XRPUSDT BUY abc", OPERATOR)
+    out = await r.handle("/bitget_open XRPUSDT BUY abc", OPERATOR)
     assert "Invalid number" in out
 
 
@@ -417,13 +425,13 @@ async def test_open_surfaces_an_exchange_exception():
 
     r = _router(orch=_orch(orders=_Boom()))
     r.positions.adapter = _Adapter(mark=2.1)
-    out = await r.handle("/open XRPUSDT BUY 1.9", OPERATOR)
+    out = await r.handle("/bitget_open XRPUSDT BUY 1.9", OPERATOR)
     assert "Order failed" in out and "40762" in out
 
 
 async def test_open_without_an_orchestrator_is_refused_not_crashed():
     r = _router(orch=None)
-    out = await r.handle("/open XRPUSDT BUY 1.9", OPERATOR)
+    out = await r.handle("/bitget_open XRPUSDT BUY 1.9", OPERATOR)
     assert "unavailable" in out.lower()
 
 
