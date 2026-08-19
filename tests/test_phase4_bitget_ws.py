@@ -363,3 +363,45 @@ async def test_empty_whitelist_session_subscribes_sentinel_and_feeds_deadman():
     assert ws.mark_price("BTCUSDT") == 63_111.5
     assert ws.is_stale(ttl=60) is False
     assert ready == [True]
+
+
+@pytest.mark.asyncio
+async def test_add_symbols_resubscribes_without_dropping_existing():
+    """Runtime add: an open position's coin is tracked live, the subscribe frame
+    carries it, and the liveness sentinel is (re)used as the dead-man feed when
+    no real symbol is tracked but is dropped in favour of the real symbol (which
+    also feeds the watchdog)."""
+    fake = FakeWS([TICK])
+    ws = BitgetWS(symbols=[], product_type="USDT-FUTURES", connector=connector_for(fake))
+    ws._loop = asyncio.get_event_loop()
+    await ws.start()
+    await asyncio.sleep(0.05)  # let the session subscribe once (sentinel only)
+    assert ws.tracked_symbols() == []  # only the sentinel so far
+    ws.add_symbols(["PUMPUSDT"])
+    await asyncio.sleep(0.05)
+    assert "PUMPUSDT" in ws.symbols
+    # the latest subscribe frame must carry PUMPUSDT (dead-man fed by it now)
+    sub_frames = [json.loads(s) for s in fake.sent if json.loads(s).get("op") == "subscribe"]
+    last = sub_frames[-1]["args"]
+    inst_ids = {a.get("instId") for a in last}
+    assert "PUMPUSDT" in inst_ids
+    await ws.stop()
+
+
+@pytest.mark.asyncio
+async def test_remove_symbols_returns_to_sentinel_feed():
+    fake = FakeWS([TICK])
+    ws = BitgetWS(symbols=[], product_type="USDT-FUTURES", connector=connector_for(fake))
+    ws._loop = asyncio.get_event_loop()
+    await ws.start()
+    await asyncio.sleep(0.05)
+    ws.add_symbols(["PUMPUSDT"])
+    await asyncio.sleep(0.05)
+    assert "PUMPUSDT" in ws.symbols
+    ws.remove_symbols(["PUMPUSDT"])
+    await asyncio.sleep(0.05)
+    assert "PUMPUSDT" not in ws.symbols
+    # with no real symbols left, the liveness sentinel is re-subscribed
+    sub_frames = [json.loads(s) for s in fake.sent if json.loads(s).get("op") == "subscribe"]
+    assert BitgetWS.LIVENESS_SENTINEL in {a.get("instId") for a in sub_frames[-1]["args"]}
+    await ws.stop()

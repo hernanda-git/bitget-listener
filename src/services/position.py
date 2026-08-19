@@ -65,6 +65,20 @@ class PositionManager:
             log.warning("protection sync failed for %s: %s", instrument.symbol, exc)
             return None, None
 
+    async def _best_effort_attach(self, pos: Position, sl, tp) -> dict:
+        """Attempt to attach protection on the venue, but NEVER let a venue
+        failure block the bot-side level (set by the caller beforehand). Returns a
+        status dict; on exchange failure it reports DEGRADED so the operator knows
+        the protection is monitor-side only."""
+        if sl is None and tp is None:
+            return {"status": "NOOP"}
+        try:
+            return await self.orders.attach_protective(pos, sl, tp)
+        except Exception as exc:  # noqa: BLE001 - exchange tpsl may be unavailable
+            log.warning("venue protective attach failed for %s (monitor-side only): %s",
+                        pos.instrument.symbol, exc)
+            return {"status": "DEGRADED", "reason": str(exc)}
+
     # ---------------------------------------------------------- management verbs
     async def sl_to_entry(self, symbol: str) -> dict:
         """Move the stop to break-even. Never widens an existing stop."""
@@ -76,8 +90,11 @@ class PositionManager:
             tighter = (new_sl >= pos.sl_price) if pos.side is Side.BUY else (new_sl <= pos.sl_price)
             if not tighter:
                 return {"status": "REJECTED", "reason": "would widen the stop", "symbol": symbol}
-        res = await self.orders.attach_protective(pos, new_sl, pos.tp_price)
+        # Bot-side monitor is authoritative when the exchange tpsl endpoint is
+        # unavailable: set the local level FIRST so the WS monitor protects even
+        # if the venue attachment fails.
         self.upsert(Position(**{**pos.__dict__, "sl_price": new_sl}))
+        res = await self._best_effort_attach(pos, new_sl, pos.tp_price)
         return {"status": res.get("status", "OK"), "action": "sl_to_entry", "sl": new_sl}
 
     async def book_partial(self, symbol: str, fraction: float = 0.5) -> dict:
@@ -110,10 +127,12 @@ class PositionManager:
         pos = self.get(symbol)
         if pos is None:
             return {"status": "NO_POSITION", "symbol": symbol}
-        res = await self.orders.attach_protective(pos, sl, tp)
+        # Set the bot-side level FIRST so the WS monitor is armed even if the
+        # venue attachment fails (exchange tpsl endpoint is unreliable).
         self.upsert(Position(**{**pos.__dict__,
                                 "sl_price": sl if sl is not None else pos.sl_price,
                                 "tp_price": tp if tp is not None else pos.tp_price}))
+        res = await self._best_effort_attach(pos, sl, tp)
         return {"status": res.get("status"), "action": "modify_stop", "sl": sl, "tp": tp}
 
     async def cancel_pending(self, symbol: str) -> dict:
@@ -143,13 +162,30 @@ class PositionManager:
         return (mark <= position.sl_price) if position.side is Side.BUY \
             else (mark >= position.sl_price)
 
+    def target_breached(self, position: Position, mark: float) -> bool:
+        """TP/limit side: a long banks profit above target, a short below."""
+        if position.tp_price is None:
+            return False
+        return (mark >= position.tp_price) if position.side is Side.BUY \
+            else (mark <= position.tp_price)
+
     async def on_mark(self, symbol: str, mark: float) -> dict | None:
-        """Real-time stop enforcement: close if the mark has breached the stop."""
+        """Real-time SL/TP enforcement driven by the price WebSocket.
+
+        Close (full) when the mark breaches EITHER the stop or the target. Returns
+        the close result, or None when no level is breached. The orchestrator books
+        the trade ledger + daily PnL from this result.
+        """
         pos = self.get(symbol)
-        if pos is None or not self.stop_breached(pos, mark):
+        if pos is None:
             return None
-        log.warning("stop breached %s mark=%s sl=%s — closing", symbol, mark, pos.sl_price)
-        return await self.full_close(symbol, reason="stop_breached")
+        if self.stop_breached(pos, mark):
+            log.warning("STOP breached %s mark=%s sl=%s — closing", symbol, mark, pos.sl_price)
+            return await self.full_close(symbol, reason="stop_breached")
+        if self.target_breached(pos, mark):
+            log.info("TARGET hit %s mark=%s tp=%s — closing", symbol, mark, pos.tp_price)
+            return await self.full_close(symbol, reason="target_hit")
+        return None
 
     # ----------------------------------------------------------- liquidation (B)
     def book_liquidation(self, position: Position, last_mark: float | None = None) -> dict:

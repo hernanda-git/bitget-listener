@@ -165,19 +165,20 @@ class Orchestrator:
             except Exception as exc:
                 log.error("position sync failed after open (%s) — keeping local view", exc)
                 self._local_position(order)
-            # Place the trader's EXACT SL/TP as resting plan orders (BUG C:
-            # reduce-only, never auto-cancelled). A fill without protection is a
-            # naked position; the signal's stop/target is authoritative.
-            if (order.sl is not None or order.tp is not None):
+            # The WS monitor is the primary SL/TP enforcement (the exchange tpsl
+            # endpoint is unreliable). Seed the position's bot-side SL/TP from the
+            # signal NOW so the monitor is armed even before/without venue attach.
+            pos = self.positions.get(order.instrument.symbol)
+            if pos is not None and (order.sl is not None or order.tp is not None):
+                self.positions.upsert(Position(**{**pos.__dict__,
+                    "sl_price": order.sl if order.sl is not None else pos.sl_price,
+                    "tp_price": order.tp if order.tp is not None else pos.tp_price}))
+                pos = self.positions.get(order.instrument.symbol)
+            # Place the trader's EXACT SL/TP as resting plan orders on the venue
+            # (BUG C: reduce-only, never auto-cancelled) as a best-effort belt-
+            # AND-suspenders; monitor-side closure is the real safety net.
+            if pos is not None and (order.sl is not None or order.tp is not None):
                 try:
-                    existing = self.positions.get(order.instrument.symbol)
-                    pos = Position(
-                        instrument=order.instrument, side=order.side, size=order.qty,
-                        entry_price=order.price or 0.0, leverage=order.leverage,
-                        margin_mode=order.margin_mode,
-                        sl_price=existing.sl_price if existing else None,
-                        tp_price=existing.tp_price if existing else None,
-                    )
                     plan = await self.orders.attach_protective(pos, order.sl, order.tp)
                     if self.notifier is not None:
                         with contextlib.suppress(Exception):
@@ -186,12 +187,16 @@ class Orchestrator:
                                 f"SL={order.sl} TP={order.tp} ({plan.get('status')})")
                 except Exception as exc:
                     log.error("attach_protective failed after open (%s) — position is "
-                              "NAKED, operator must set stops manually", exc)
+                              "NAKED on the venue but MONITOR-ARMED via bot-side SL/TP", exc)
                     if self.notifier is not None:
                         with contextlib.suppress(Exception):
                             await self.notifier.send(
-                                f"WARNING {order.instrument.symbol} opened WITHOUT stops "
-                                f"(attach failed: {exc}). Set SL/TP manually.")
+                                f"WARNING {order.instrument.symbol} venue stops FAILED "
+                                f"(monitor-side SL/TP armed: SL={order.sl} TP={order.tp}). "
+                                f"Attach error: {exc}")
+        # Ensure the WS price feed tracks this position's coin so the SL/TP
+        # monitor receives ticks for it (not just the dead-man sentinel).
+        self._track_position_symbols()
         if self.notifier is not None:
             with contextlib.suppress(Exception):
                 await self.notifier.send(TelegramNotifier.format_entry(result))
@@ -228,6 +233,8 @@ class Orchestrator:
         if action in ("full_close", "partial") and res.get("status") not in (
                 "NO_POSITION", "REJECTED"):
             await self._book_close(symbol, res)
+        # Re-sync the WS price feed: a close frees a symbol, a partial keeps it.
+        self._track_position_symbols()
         return res
 
     def _only_open_symbol(self) -> str | None:
@@ -270,9 +277,25 @@ class Orchestrator:
     def on_position(self, position) -> None:
         self.gate.observe_position(position)
         self.positions.upsert(position)
+        self._track_position_symbols()
 
     async def on_tick(self, symbol: str, mark: float) -> None:
-        await self.positions.on_mark(symbol, mark)
+        res = await self.positions.on_mark(symbol, mark)
+        if res is not None and res.get("status") not in ("NO_POSITION", "REJECTED"):
+            await self._book_close(symbol, res)
+
+    def _track_position_symbols(self) -> None:
+        """Keep the public WS subscribed to every open position's coin so the
+        SL/TP monitor actually receives ticks for it (and the dead-man sentinel
+        stays as a fallback when nothing is open)."""
+        if self.stream is None or getattr(self.stream, "private", True):
+            return
+        syms = list(self.positions.positions.keys())
+        if syms:
+            self.stream.add_symbols(syms)
+        else:
+            # Nothing open: ensure at least the liveness sentinel is tracked.
+            self.stream.add_symbols([getattr(self.stream, "LIVENESS_SENTINEL", "BTCUSDT")])
 
     # ------------------------------------------------------------------ lifecycle
     async def run_once(self) -> int:
@@ -321,18 +344,22 @@ class Orchestrator:
 
     async def _protection_sampler(self) -> None:
         """BUG #3: periodically refresh the REAL resting SL/TP for open positions
-        so /api/state (and the dashboard) surface live plan-order protection even
-        though the private WS positions channel does not carry it."""
+        so /api/state surfaces live plan-order protection.
+
+        Merge rule: exchange values win ONLY when present; a bot-side level that
+        the monitor depends on (set from the signal or via /sl_modify) is NEVER
+        clobbered to None just because the venue has no plan order.
+        """
         while self._running:
             try:
                 await asyncio.sleep(getattr(self, "protection_sample_sec", 30))
                 for sym, pos in list(self.positions.positions.items()):
                     sl, tp = await self.positions._protection(pos.instrument)
-                    if sl is None and tp is None:
-                        continue
-                    self.positions.upsert(Position(**{**pos.__dict__,
-                        "sl_price": sl if sl is not None else pos.sl_price,
-                        "tp_price": tp if tp is not None else pos.tp_price}))
+                    new_sl = sl if sl is not None else pos.sl_price
+                    new_tp = tp if tp is not None else pos.tp_price
+                    if new_sl != pos.sl_price or new_tp != pos.tp_price:
+                        self.positions.upsert(Position(**{**pos.__dict__,
+                            "sl_price": new_sl, "tp_price": new_tp}))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001

@@ -440,6 +440,40 @@ async def test_on_mark_noop_when_stop_intact():
     assert await mgr.on_mark("BTCUSDT", 59_000.0) is None
 
 
+@pytest.mark.asyncio
+async def test_on_mark_closes_when_tp_hit_long():
+    """TP monitoring: a long is closed when mark rises to/above its target."""
+    fake, mgr = manager()
+    pos = fake.seed_position(side=Side.BUY, entry=60_000.0)
+    pos.tp_price = 66_000.0
+    mgr.upsert(pos)
+    res = await mgr.on_mark("BTCUSDT", 66_100.0)
+    assert res is not None and res.get("action") == "full_close"
+    assert mgr.get("BTCUSDT") is None
+
+
+@pytest.mark.asyncio
+async def test_on_mark_noop_when_tp_not_hit():
+    fake, mgr = manager()
+    pos = fake.seed_position(side=Side.BUY, entry=60_000.0)
+    pos.tp_price = 66_000.0
+    mgr.upsert(pos)
+    assert await mgr.on_mark("BTCUSDT", 65_000.0) is None
+
+
+@pytest.mark.asyncio
+async def test_modify_stop_arms_monitor_even_if_venue_attach_fails():
+    """When the exchange tpsl endpoint is unavailable the bot-side SL/TP must
+    still be set so the WS monitor can enforce the close."""
+    fake, mgr = manager()
+    mgr.upsert(fake.seed_position())
+    fake.fail_next_code = "43011"   # simulate broken place-tpsl-order
+    res = await mgr.modify_stop("BTCUSDT", sl=58_000.0, tp=70_000.0)
+    pos = mgr.get("BTCUSDT")
+    assert pos.sl_price == 58_000.0 and pos.tp_price == 70_000.0
+    assert res["status"] is not None
+
+
 # ------------------------------------------------------------- liquidation (B)
 def test_book_liquidation_uses_the_real_exchange_price():
     _, mgr = manager()

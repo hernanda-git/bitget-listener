@@ -70,6 +70,7 @@ class BitgetWS(MarketStream):
         self._marks: dict[str, float] = {}
         self._task: asyncio.Task | None = None
         self._ws = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._running = False
         self.last_msg_ts: float = 0.0
         self.connected = False
@@ -111,6 +112,7 @@ class BitgetWS(MarketStream):
         if self._running:
             return
         self._running = True
+        self._loop = asyncio.get_event_loop()
         self._task = asyncio.create_task(self._run_forever())
 
     async def stop(self) -> None:
@@ -127,6 +129,69 @@ class BitgetWS(MarketStream):
 
     def mark_price(self, symbol: str) -> float | None:
         return self._marks.get(symbol.upper())
+
+    def tracked_symbols(self) -> list[str]:
+        """Public symbols currently subscribed (excludes the silent sentinel)."""
+        return [s for s in self.symbols if s != self.LIVENESS_SENTINEL]
+
+    def add_symbols(self, symbols: list[str]) -> bool:
+        """Subscribe to extra symbols at runtime (e.g. an open position's coin)
+        without dropping the symbols already subscribed.
+
+        Returns True when at least one NEW symbol was added and a (re)subscribe
+        frame was sent. Safe to call with an empty list or already-tracked ones.
+        """
+        if self.private:
+            return False
+        added = []
+        for s in (x.upper() for x in symbols):
+            if s not in self.symbols:
+                self.symbols.append(s)
+                added.append(s)
+        if not added:
+            return False
+        if self._ws is not None and self._running:
+            with contextlib.suppress(Exception):
+                self._send_subscribe()
+            log.info("WS %s added symbols %s", self.url, added)
+        return True
+
+    def remove_symbols(self, symbols: list[str]) -> bool:
+        """Unsubscribe symbols we no longer need to track (e.g. a closed position).
+        The liveness sentinel is never removed while the stream is the only feed."""
+        if self.private:
+            return False
+        removed = []
+        for s in (x.upper() for x in symbols):
+            if s in self.symbols and s != self.LIVENESS_SENTINEL:
+                self.symbols.remove(s)
+                removed.append(s)
+        if not removed:
+            return False
+        # Bitget has no lightweight unsubscribe need here: re-sending the full
+        # subscribe list re-binds the connection to the reduced set.
+        if self._ws is not None and self._running:
+            with contextlib.suppress(Exception):
+                self._send_subscribe()
+            log.info("WS %s removed symbols %s", self.url, removed)
+        return True
+
+    def _send_subscribe(self) -> None:
+        """Send the current subscribe frame on the live socket.
+
+        Safe to call from anywhere: if a loop is running it schedules the send on
+        that loop; if not (e.g. before start), the new symbols are simply picked
+        up by ``subscribe_frame()`` at the next (re)connect, since it reads
+        ``self.symbols`` live.
+        """
+        if self._ws is None or self._loop is None or not self._loop.is_running():
+            return
+        sub = self.subscribe_frame()
+        with contextlib.suppress(Exception):
+            self.rate_limit.acquire("ws")
+        with contextlib.suppress(Exception):
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._ws.send(json.dumps(sub))))
 
     def is_stale(self, ttl: float = 60.0) -> bool:
         """Dead-man's-switch input: True when no frame arrived within ``ttl`` seconds."""
