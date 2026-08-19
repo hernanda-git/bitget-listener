@@ -38,6 +38,21 @@ async def main():
     )
     ledger = TradeLedger(os.environ.get("LEDGER_PATH", "bitget_listener.db"))
     positions = SimpleNamespace(positions={}, adapter=adapter, stream=None)
+
+    # Optional: seed a fake position so the populated layouts can be inspected
+    # without waiting for a real fill. Never touches the exchange.
+    if "--demo" in sys.argv:
+        from src.domain.model import Instrument as I, Position as P, Side
+        positions.positions = {
+            "XRPUSDT": P(instrument=I.from_token("XRP"), side=Side.BUY,
+                         size=17.0, entry_price=2.8412, sl_price=2.7100,
+                         tp_price=3.0500, liq_price=2.4050,
+                         unrealized_pnl=0.3417),
+            "DOGEUSDT": P(instrument=I.from_token("DOGE"), side=Side.SELL,
+                          size=240.0, entry_price=0.20841, sl_price=0.21900,
+                          tp_price=0.19200, liq_price=None,
+                          unrealized_pnl=-0.1128),
+        }
     gate = SimpleNamespace(status=lambda: {
         "mode": "LIVE", "paper": False, "unmet": [], "conditions_met": False})
     orch = SimpleNamespace(daily_realized=0.0, deadman_halted=False,

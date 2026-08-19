@@ -352,31 +352,31 @@ async def test_status_is_readable_without_authorization():
     """Monitoring is harmless and must not be gated."""
     *_, r = router()
     out = await r.handle("/status", sender_id="stranger")
-    assert "mode: PAPER" in out
-    assert "go-live blocked by" in out
+    assert "PAPER" in out
+    assert "Go-live checklist" in out
 
 
 @pytest.mark.asyncio
 async def test_positions_and_pairs_are_open_reads():
     fake, gate, mgr, r = router()
-    assert "no open positions" in await r.handle("/positions", sender_id="x")
+    assert "No open positions" in await r.handle("/positions", sender_id="x")
     mgr.upsert(fake.seed_position(liq=54_000.0))
     assert "BTCUSDT" in await r.handle("/positions", sender_id="x")
-    assert "no flagged pairs" in await r.handle("/pairs", sender_id="x")
+    assert "No flagged pairs" in await r.handle("/pairs", sender_id="x")
 
 
 @pytest.mark.asyncio
 async def test_state_changing_commands_require_the_operator():
     *_, r = router()
     for cmd in ("/toggle", "/paper", "/live abc", "/close BTCUSDT"):
-        assert "unauthorized" in await r.handle(cmd, sender_id="intruder")
+        assert "Not authorized" in await r.handle(cmd, sender_id="intruder")
 
 
 @pytest.mark.asyncio
 async def test_router_fails_closed_without_an_operator_id():
     fake, gate, mgr, _ = router()
     r = CommandRouter(gate, mgr, ShadowLedger(), operator_id="")
-    assert "unauthorized" in await r.handle("/toggle", sender_id="42")
+    assert "Not authorized" in await r.handle("/toggle", sender_id="42")
 
 
 @pytest.mark.asyncio
@@ -389,7 +389,7 @@ async def test_toggle_to_live_is_refused_when_conditions_unmet():
 @pytest.mark.asyncio
 async def test_live_command_requires_a_token():
     *_, r = router()
-    assert "usage" in await r.handle("/live", sender_id="42")
+    assert "Usage" in await r.handle("/live", sender_id="42")
 
 
 @pytest.mark.asyncio
@@ -423,7 +423,7 @@ async def test_close_command_closes_a_position():
 @pytest.mark.asyncio
 async def test_unknown_command():
     *_, r = router()
-    assert "unknown command" in await r.handle("/nope", sender_id="42")
+    assert "Unknown command" in await r.handle("/nope", sender_id="42")
 
 
 @pytest.mark.asyncio

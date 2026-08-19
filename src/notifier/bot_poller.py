@@ -68,9 +68,9 @@ async def register_bot_commands(router) -> bool:
     token = os.getenv("TG_BOT_TOKEN", "")
     if not token:
         return False
-    cmds = [{"command": name, "description": (f"{desc} — args: {args}" if args
+    cmds = [{"command": name, "description": (f"{desc} — {args}" if args
                                               else desc)[:256]}
-            for name, args, desc, _ in router.COMMANDS]
+            for name, args, desc, *_rest in router.COMMANDS]
     try:
         client = await get_client()
         r = await client.post(

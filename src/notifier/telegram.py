@@ -22,6 +22,7 @@ import httpx
 
 from src.domain.model import Instrument, Position, Side, Signal
 from src.interfaces.ports import Notifier
+from src.notifier import fmt
 
 log = logging.getLogger(__name__)
 
@@ -107,23 +108,28 @@ class CommandRouter:
     """Routes operator commands. State-changing commands require the operator id."""
 
     # Single source of truth for the menu, /help and the BotFather registration.
-    # (command, args, description, state_changing)
-    COMMANDS: list[tuple[str, str, str, bool]] = [
-        ("help", "", "show this command list", False),
-        ("status", "", "mode, positions, PnL, gate blockers", False),
-        ("health", "", "liveness: mode, deadman, breaker, command channel", False),
-        ("balance", "", "futures wallet + available margin", False),
-        ("positions", "", "open positions with unrealized PnL", False),
-        ("pnl", "", "unrealized + daily realized + lifetime net", False),
-        ("activity", "[n]", "recent closed trades (default 5)", False),
-        ("pairs", "", "pairs flagged weak by the shadow ledger", False),
-        ("open", "<SYM> <BUY|SELL> <sl> [tp] [usd]", "manually open a position", True),
-        ("close", "<SYM|all>", "market-close a position", True),
-        ("sl_to_entry", "<SYM>", "move stop-loss to break-even", True),
-        ("toggle", "", "flip PAPER/LIVE (gate-guarded)", True),
-        ("paper", "", "force PAPER mode immediately", True),
-        ("live", "<token>", "redeem a go-live token", True),
+    # (command, args, description, state_changing, group)
+    COMMANDS: list[tuple[str, str, str, bool, str]] = [
+        ("status", "", "position, PnL and mode overview", False, "Monitor"),
+        ("positions", "", "open positions with live PnL", False, "Monitor"),
+        ("pnl", "", "unrealized, daily and lifetime PnL", False, "Monitor"),
+        ("balance", "", "wallet, margin and equity", False, "Monitor"),
+        ("activity", "[n]", "recent closed trades", False, "Monitor"),
+        ("health", "", "system liveness and safety rails", False, "Monitor"),
+        ("pairs", "", "pairs flagged weak by the shadow ledger", False, "Monitor"),
+        ("open", "<SYM> <BUY|SELL> <sl> [tp] [usd]",
+         "open a position manually", True, "Trade"),
+        ("close", "<SYM|all>", "market-close a position", True, "Trade"),
+        ("sl_to_entry", "<SYM>", "move stop-loss to break-even", True, "Trade"),
+        ("toggle", "", "switch between paper and live", True, "Control"),
+        ("paper", "", "return to paper mode immediately", True, "Control"),
+        ("live", "<token>", "redeem a go-live token", True, "Control"),
+        ("help", "", "show this menu", False, "Monitor"),
     ]
+
+    # Order the groups appear in the menu.
+    GROUP_ORDER = ("Monitor", "Trade", "Control")
+    GROUP_GLYPH = {"Monitor": "📊", "Trade": "⚡", "Control": "🔐"}
 
     def __init__(self, gate, position_manager, shadow_ledger, ledger=None,
                  operator_id: str | None = None, orchestrator=None) -> None:
@@ -146,24 +152,22 @@ class CommandRouter:
 
     def help_text(self, authorized: bool = True) -> str:
         """The menu shown for /help and for a bare '/'."""
-        read = [c for c in self.COMMANDS if not c[3]]
-        write = [c for c in self.COMMANDS if c[3]]
-
-        def fmt(rows):
-            out = []
-            for name, args, desc, _ in rows:
+        blocks = [fmt.title("Bitget Listener", "🤖")]
+        for group in self.GROUP_ORDER:
+            rows = [c for c in self.COMMANDS if c[4] == group]
+            if not rows:
+                continue
+            glyph = self.GROUP_GLYPH.get(group, "")
+            locked = " · operator only" if rows[0][3] else ""
+            section = [f"{glyph} <b>{group}</b>{locked}"]
+            for name, args, desc, _sc, _g in rows:
                 usage = f"/{name} {args}".strip()
-                out.append(f"<code>{usage}</code> — {desc}")
-            return out
-
-        lines = ["<b>bitget-listener commands</b>", "", "<b>Read-only</b>"]
-        lines += fmt(read)
-        lines += ["", "<b>Operator only</b> (state-changing)"]
-        lines += fmt(write)
+                section.append(f"<code>{usage}</code>\n{fmt.BULLET} {desc}")
+            blocks.append("\n".join(section))
         if not authorized:
-            lines += ["", "⚠️ you are not the configured operator — "
-                          "state-changing commands will be refused"]
-        return "\n".join(lines)
+            blocks.append(fmt.hint("You are not the configured operator. "
+                                   "Monitoring works; trading commands are refused."))
+        return fmt.join(*blocks)
 
     async def handle(self, text: str, sender_id: str | int = "") -> str:
         parts = text.strip().split()
@@ -183,61 +187,89 @@ class CommandRouter:
             return await self._read_only(cmd, args)
 
         if not self.authorized(sender_id):
-            return "unauthorized — state-changing commands are operator-only"
+            return fmt.join(
+                fmt.title("Not authorized", "🔒"),
+                fmt.hint("Trading commands are limited to the configured operator. "
+                         "Monitoring commands are open — try /status."))
 
         if cmd == "/toggle":
-            return self.gate.toggle("telegram")
+            return fmt.join(fmt.title("Mode change", "🔐"),
+                            str(self.gate.toggle("telegram")))
         if cmd == "/paper":
-            return self.gate.to_paper("telegram")
+            return fmt.join(fmt.title("Paper mode", "🧪"),
+                            str(self.gate.to_paper("telegram")))
         if cmd == "/live":
             if not args:
-                return "usage: /live <token>  (run --go-live first)"
+                return fmt.join(fmt.title("Go live", "🔐"),
+                                fmt.row("Usage", "/live <token>"),
+                                fmt.hint("Mint a token first, then redeem it here."))
             ok, msg = self.gate.redeem(args[0])
-            return msg
+            return fmt.join(fmt.title("Go live" if ok else "Rejected",
+                                      "✅" if ok else "⚠️"), str(msg))
         if cmd == "/close":
             return await self._close(args)
         if cmd == "/open":
             return await self._open(args)
         if cmd == "/sl_to_entry":
             if not args:
-                return "usage: /sl_to_entry <SYMBOL>"
-            return str(await self.positions.sl_to_entry(args[0].upper()))
-        return f"unknown command: {cmd}\nsend /help for the list"
+                return fmt.join(fmt.title("Move stop to entry", "⚡"),
+                                fmt.row("Usage", "/sl_to_entry <SYMBOL>"))
+            res = await self.positions.sl_to_entry(args[0].upper())
+            return fmt.join(fmt.title("Stop moved to entry", "⚡"), str(res))
+        return fmt.join(fmt.title("Unknown command", "❔"),
+                        fmt.plain_row("Received", f"<code>{cmd}</code>"),
+                        fmt.hint("Send /help to see everything available."))
 
     async def _close(self, args: list[str]) -> str:
         if not args:
-            return "usage: /close <SYMBOL|all>"
+            return fmt.join(fmt.title("Close a position", "⚡"),
+                            fmt.row("Usage", "/close <SYMBOL>"),
+                            fmt.row("Or", "/close all"))
         target = args[0].upper()
         if target == "ALL":
             syms = list(self.positions.positions.keys())
             if not syms:
-                return "no open positions"
-            out = []
+                return fmt.join(fmt.title("Nothing to close", "📭"),
+                                fmt.hint("The bot is already flat."))
+            rows, failures = [], 0
             for sym in syms:
                 try:
                     res = await self.positions.full_close(sym, reason="telegram")
-                    out.append(f"{sym}: {res.get('status')}")
+                    rows.append(fmt.plain_row(f"✅ {sym}", str(res.get("status"))))
                 except Exception as exc:            # report, never abort the rest
-                    out.append(f"{sym}: ERROR {type(exc).__name__}: {exc}")
-            return "\n".join(out)
+                    failures += 1
+                    rows.append(fmt.plain_row(f"⚠️ {sym}",
+                                              f"{type(exc).__name__}: {exc}"))
+            head = fmt.title(
+                f"Closed {len(syms) - failures}/{len(syms)}",
+                "✅" if not failures else "⚠️")
+            return fmt.join(head, fmt.lines(*rows))
         res = await self.positions.full_close(target, reason="telegram")
-        return f"{target}: {res.get('status')}"
+        return fmt.join(fmt.title("Position closed", "✅"),
+                        fmt.plain_row("Symbol", f"<b>{target}</b>"),
+                        fmt.plain_row("Result", str(res.get("status"))))
 
     async def _open(self, args: list[str]) -> str:
         """Manual entry. SL is MANDATORY — the sizer refuses an entry without one."""
+        usage = fmt.join(
+            fmt.title("Open a position", "⚡"),
+            fmt.lines(fmt.row("Usage", "/open <SYMBOL> <BUY|SELL> <sl> [tp] [usd]"),
+                      fmt.row("Example", "/open XRPUSDT BUY 2.10")),
+            fmt.hint("A stop-loss is mandatory — the bot refuses any entry "
+                     "without one."))
         if len(args) < 3:
-            return ("usage: /open <SYMBOL> <BUY|SELL> <sl> [tp] [usd]\n"
-                    "example: <code>/open XRPUSDT BUY 2.10</code>\n"
-                    "SL is mandatory (the bot refuses any entry without one).")
+            return usage
         if self.orch is None:
-            return "manual open unavailable: orchestrator not wired into the router"
+            return fmt.join(fmt.title("Manual open unavailable", "⚠️"),
+                            fmt.hint("The orchestrator is not wired into the router."))
 
         sym = args[0].upper()
         if not sym.endswith("USDT"):
             sym += "USDT"
         side_txt = args[1].upper()
         if side_txt not in ("BUY", "SELL", "LONG", "SHORT"):
-            return "side must be BUY or SELL"
+            return fmt.join(fmt.title("Invalid side", "⚠️"),
+                            fmt.hint("Side must be BUY or SELL."))
         side = Side.BUY if side_txt in ("BUY", "LONG") else Side.SELL
 
         try:
@@ -245,24 +277,34 @@ class CommandRouter:
             tp = float(args[3]) if len(args) > 3 and args[3] != "-" else None
             notional = float(args[4]) if len(args) > 4 else 0.0
         except ValueError:
-            return "sl / tp / usd must be numbers"
+            return fmt.join(fmt.title("Invalid number", "⚠️"),
+                            fmt.hint("Stop, target and size must be numbers."))
         if sl <= 0:
-            return "sl must be > 0"
+            return fmt.join(fmt.title("Invalid stop", "⚠️"),
+                            fmt.hint("The stop-loss must be greater than zero."))
 
         inst = Instrument.from_token(sym.replace("USDT", ""))
         if self._adapter is None:
-            return "no exchange adapter wired"
+            return fmt.join(fmt.title("No exchange adapter", "⚠️"))
         try:
             mark = await self._adapter.get_mark_price(inst)
         except Exception as exc:
-            return f"could not fetch mark price: {type(exc).__name__}: {exc}"
+            return fmt.join(fmt.title("Price unavailable", "⚠️"),
+                            fmt.hint(f"{type(exc).__name__}: {exc}"))
 
         # Refuse a stop on the wrong side of the market — this would be an
         # instant-liquidating entry, not a trade.
-        if side is Side.BUY and sl >= mark:
-            return f"refused: BUY stop {sl} is at/above mark {mark}"
-        if side is Side.SELL and sl <= mark:
-            return f"refused: SELL stop {sl} is at/below mark {mark}"
+        wrong_side = ((side is Side.BUY and sl >= mark)
+                      or (side is Side.SELL and sl <= mark))
+        if wrong_side:
+            where = "at or above" if side is Side.BUY else "at or below"
+            return fmt.join(
+                fmt.title("Entry refused", "🛑"),
+                fmt.lines(fmt.plain_row("Reason",
+                                        f"stop is {where} the current price"),
+                          fmt.row("Stop", fmt.price(sl)),
+                          fmt.row("Mark", fmt.price(mark))),
+                fmt.hint("This would liquidate immediately."))
 
         if notional <= 0:
             params = getattr(self.orch, "params", {}) or {}
@@ -274,19 +316,32 @@ class CommandRouter:
         try:
             res = await self.orch.orders.open_from_signal(sig, mark_price=mark)
         except Exception as exc:
-            return f"open FAILED: {type(exc).__name__}: {exc}"
+            return fmt.join(fmt.title("Order failed", "⚠️"),
+                            fmt.plain_row("Symbol", f"<b>{sym}</b>"),
+                            fmt.hint(f"{type(exc).__name__}: {exc}"))
 
-        status = res.get("status")
-        lines = [f"<b>{sym} {side.value} — {status}</b>",
-                 f"mark: {mark}  sl: {sl}" + (f"  tp: {tp}" if tp else ""),
-                 f"notional: ${notional:.2f}"]
-        for key in ("size", "reason", "order_id", "avg_price"):
-            if res.get(key) is not None:
-                lines.append(f"{key}: {res[key]}")
-        if str(status).upper() in ("FILLED", "OK", "PLACED", "OPEN"):
-            await self.orch._after_open(sig, res) if hasattr(
-                self.orch, "_after_open") else None
-        return "\n".join(lines)
+        status = str(res.get("status") or "")
+        filled = status.upper() in ("FILLED", "OK", "PLACED", "OPEN")
+        head = fmt.title("Position opened" if filled else f"Order {status.lower()}",
+                         "✅" if filled else "⚠️")
+        body = [fmt.plain_row("Symbol",
+                              f"<b>{sym}</b>  {fmt.side_glyph(side.value)} "
+                              f"{side.value}"),
+                fmt.row("Entry", fmt.price(mark)),
+                fmt.row("Stop", fmt.price(sl))]
+        if tp:
+            body.append(fmt.row("Target", fmt.price(tp)))
+        body.append(fmt.row("Size", f"${notional:.2f}"))
+        if res.get("size") is not None:
+            body.append(fmt.row("Contracts", fmt.qty(res["size"])))
+        if res.get("avg_price") is not None:
+            body.append(fmt.row("Avg fill", fmt.price(res["avg_price"])))
+        blocks = [head, fmt.lines(*body)]
+        if res.get("reason"):
+            blocks.append(fmt.hint(str(res["reason"])))
+        if filled and hasattr(self.orch, "_after_open"):
+            await self.orch._after_open(sig, res)
+        return fmt.join(*blocks)
 
     # --------------------------------------------------------------- read-only
     async def _mark(self, symbol: str) -> float | None:
@@ -308,43 +363,71 @@ class CommandRouter:
             return None
 
     async def _upnl_rows(self) -> tuple[list[str], float]:
-        """Per-position lines plus the summed unrealized PnL."""
-        rows, total = [], 0.0
+        """Per-position cards plus the summed unrealized PnL."""
+        cards, total = [], 0.0
         for p in self.positions.positions.values():
             sym = p.instrument.symbol
-            # Trust the venue's own unrealizedPL when present (BUG B discipline:
-            # never invent a number); otherwise derive it from the mark.
+            # Trust the venue's own unrealizedPL when present (never invent one);
+            # otherwise derive it from the live mark.
             upnl = p.unrealized_pnl
             mark = await self._mark(sym)
             if not upnl and mark and p.entry_price:
                 sign = 1 if p.side is Side.BUY else -1
                 upnl = (mark - p.entry_price) * p.size * sign
             total += upnl or 0.0
-            liq = p.liq_price if p.liq_price is not None else "n/a"
-            rows.append(
-                f"<b>{sym}</b> {p.side.value} size={p.size}\n"
-                f"  entry={p.entry_price}  mark={mark if mark else 'n/a'}\n"
-                f"  sl={p.sl_price}  tp={p.tp_price}  liq={liq}\n"
-                f"  uPnL: {upnl:+.4f} USDT")
-        return rows, total
+
+            # Percentage return on the position's own notional, derived from the
+            # SAME figure as the PnL so the sign can never contradict it.
+            move = None
+            if upnl is not None and p.entry_price and p.size:
+                notional = abs(float(p.entry_price) * float(p.size))
+                if notional > 0:
+                    move = upnl / notional * 100
+
+            head = (f"{fmt.signed_glyph(upnl)} <b>{sym}</b>  "
+                    f"{fmt.side_glyph(p.side.value)} {p.side.value}")
+            pnl_txt = fmt.money(upnl, 4, suffix=" USDT")
+            if move is not None:
+                pnl_txt += f"  ({fmt.money(move, 2)}%)"
+            cards.append(fmt.lines(
+                head,
+                fmt.plain_row("PnL", f"<b>{pnl_txt}</b>"),
+                fmt.row("Size", fmt.qty(p.size)),
+                fmt.row("Entry", fmt.price(p.entry_price)),
+                fmt.row("Mark", fmt.price(mark)),
+                fmt.row("Stop", fmt.price(p.sl_price)),
+                fmt.row("Target", fmt.price(p.tp_price)),
+                fmt.row("Liq.", fmt.price(p.liq_price)),
+            ))
+        return cards, total
 
     async def _read_only(self, cmd: str, args: list[str] | None = None) -> str:
         args = args or []
 
         if cmd == "/status":
             st = self.gate.status()
-            lines = [f"mode: {st['mode']}",
-                     f"open positions: {len(self.positions.positions)}"]
+            live = st["mode"] == "LIVE"
+            head = fmt.title("Status", "🟢" if live else "🧪")
+            mode_row = fmt.plain_row("Mode", f"<b>{st['mode']}</b>")
+            n_open = len(self.positions.positions)
+            body = [mode_row, fmt.plain_row("Open positions", f"<b>{n_open}</b>")]
+            if self.orch is not None:
+                body.append(fmt.plain_row(
+                    "Today", f"<b>{fmt.money(self.orch.daily_realized, 4)} USDT</b>"))
             if self.ledger is not None:
                 nets = self.ledger.net_pnls()
-                lines.append(f"closed trades: {len(nets)}  net: {sum(nets):+.4f} USDT")
-                lines.append(f"fees paid: {self.ledger.total_fees():.4f} USDT")
-            if self.orch is not None:
-                lines.append(f"daily realized: {self.orch.daily_realized:+.4f} USDT")
+                body.append(fmt.plain_row(
+                    "Lifetime", f"<b>{fmt.money(sum(nets), 4)} USDT</b>"
+                                f"  <i>{len(nets)} trades</i>"))
+                body.append(fmt.plain_row(
+                    "Fees", fmt.money(self.ledger.total_fees(), 4, signed=False)
+                            + " USDT"))
+            blocks = [head, fmt.lines(*body)]
             if st["unmet"]:
-                lines.append("go-live blocked by:")
-                lines += [f"  - {u}" for u in st["unmet"]]
-            return "\n".join(lines)
+                blocks.append(fmt.lines(
+                    "🔒 <b>Go-live checklist</b>",
+                    *[f"{fmt.BULLET} {u}" for u in st["unmet"]]))
+            return fmt.join(*blocks)
 
         if cmd == "/health":
             from src.notifier import bot_poller
@@ -358,73 +441,128 @@ class CommandRouter:
                     breaker = self._adapter.rate_limit.is_open()
                 except Exception:
                     breaker = None
-            ok = not any([deadman is True, breaker is True,
-                          bot_poller.tg_cmd_degraded()])
-            lines = [f"{'✅' if ok else '⚠️'} <b>{'healthy' if ok else 'DEGRADED'}</b>",
-                     f"mode: {st['mode']}",
-                     f"deadman halted: {deadman}",
-                     f"rate-limit breaker open: {breaker}",
-                     f"command channel degraded: {bot_poller.tg_cmd_degraded()}"]
+            degraded = bot_poller.tg_cmd_degraded()
+            healthy = not any([deadman is True, breaker is True, degraded])
+
+            head = fmt.title("Healthy" if healthy else "Degraded",
+                             "✅" if healthy else "⚠️")
+            rails = fmt.lines(
+                fmt.plain_row("Mode", f"<b>{st['mode']}</b>"),
+                fmt.plain_row("Trading", "halted" if deadman is True else "armed"),
+                fmt.plain_row("Rate limit",
+                              "tripped" if breaker is True
+                              else ("unknown" if breaker is None else "normal")),
+                fmt.plain_row("Commands", "degraded" if degraded else "responsive"),
+                fmt.plain_row("Open positions", str(len(self.positions.positions))),
+            )
+            blocks = [head, rails]
+            notes = []
             if bot_poller.tg_cmd_consecutive_errors:
-                lines.append(f"  consecutive poll errors: "
-                             f"{bot_poller.tg_cmd_consecutive_errors}")
-            lines.append(f"open positions: {len(self.positions.positions)}")
-            return "\n".join(lines)
+                notes.append(f"{bot_poller.tg_cmd_consecutive_errors} consecutive "
+                             "command-poll failures")
+            if deadman is True:
+                notes.append("Dead-man switch has halted new entries.")
+            if breaker is True:
+                notes.append("Rate-limit breaker is open; the bot is parked.")
+            if notes:
+                blocks.append(fmt.lines(*[f"{fmt.BULLET} {n}" for n in notes]))
+            return fmt.join(*blocks)
 
         if cmd == "/balance":
             if self._adapter is None:
-                return "no exchange adapter wired"
+                return fmt.join(fmt.title("Balance unavailable", "⚠️"),
+                                fmt.hint("No exchange adapter is wired."))
             try:
                 avail = await self._adapter.get_balance_usdt()
             except Exception as exc:
-                return f"balance unavailable: {type(exc).__name__}: {exc}"
+                return fmt.join(
+                    fmt.title("Balance unavailable", "⚠️"),
+                    fmt.plain_row("Reason", f"<code>{type(exc).__name__}</code>"),
+                    fmt.hint(str(exc)))
             coin = getattr(self._adapter, "margin_coin", "USDT")
             ptype = getattr(self._adapter, "product_type", "?")
+            demo = str(ptype).startswith("S")
             _, upnl = await self._upnl_rows()
-            lines = [f"<b>{coin} futures wallet</b>  ({ptype})",
-                     f"available: {avail:.6f} {coin}"]
+
+            body = [fmt.plain_row("Available", f"<b>{fmt.money(avail, 4, signed=False)}"
+                                               f" {coin}</b>")]
             if self.positions.positions:
-                lines.append(f"unrealized PnL: {upnl:+.4f} {coin}")
-                lines.append(f"equity (approx): {avail + upnl:.6f} {coin}")
-            return "\n".join(lines)
+                body.append(fmt.plain_row("Unrealized",
+                                          f"{fmt.money(upnl, 4)} {coin}"))
+                body.append(fmt.plain_row(
+                    "Equity", f"<b>{fmt.money(avail + upnl, 4, signed=False)}"
+                              f" {coin}</b>"))
+            blocks = [fmt.title("Wallet", "💰"), fmt.lines(*body),
+                      fmt.hint(f"{ptype}" + (" · demo funds" if demo
+                                             else " · real funds"))]
+            return fmt.join(*blocks)
 
         if cmd == "/positions":
             if not self.positions.positions:
-                return "no open positions"
-            rows, total = await self._upnl_rows()
-            return "\n".join(rows + [f"\n<b>total uPnL: {total:+.4f} USDT</b>"])
+                return fmt.join(fmt.title("No open positions", "📭"),
+                                fmt.hint("The bot is flat and waiting for a signal."))
+            cards, total = await self._upnl_rows()
+            head = fmt.title(f"Positions · {len(cards)}", "📈")
+            footer = fmt.plain_row("Total PnL",
+                                   f"<b>{fmt.money(total, 4)} USDT</b>")
+            return fmt.join(head, *cards, fmt.lines(fmt.rule(), footer))
 
         if cmd == "/pnl":
-            rows, upnl = await self._upnl_rows()
-            lines = ["<b>PnL</b>"]
-            lines.append(f"unrealized (open): {upnl:+.4f} USDT"
-                         if self.positions.positions else
-                         "unrealized (open): 0.0000 USDT (no positions)")
+            _cards, upnl = await self._upnl_rows()
+            n_open = len(self.positions.positions)
+
+            open_block = [f"{fmt.signed_glyph(upnl if n_open else None)} "
+                          f"<b>Open</b>"]
+            if n_open:
+                open_block.append(fmt.plain_row(
+                    "Unrealized", f"<b>{fmt.money(upnl, 4)} USDT</b>"
+                                  f"  <i>{n_open} position"
+                                  f"{'s' if n_open != 1 else ''}</i>"))
+            else:
+                open_block.append(fmt.plain_row("Unrealized", "flat"))
+
+            today_block = None
             if self.orch is not None:
-                cap = None
+                daily = self.orch.daily_realized
+                rows = [f"{fmt.signed_glyph(daily)} <b>Today</b>",
+                        fmt.plain_row("Realized",
+                                      f"<b>{fmt.money(daily, 4)} USDT</b>")]
                 params = getattr(self.orch, "params", {}) or {}
-                if params.get("max_daily_loss_pct") is not None:
-                    cap = params.get("max_daily_loss_pct")
-                lines.append(f"daily realized: {self.orch.daily_realized:+.4f} USDT")
+                cap = params.get("max_daily_loss_pct")
                 if cap is not None:
-                    lines.append(f"  daily-loss cap: {cap}%")
+                    rows.append(fmt.plain_row("Loss cap", fmt.pct(cap)))
                 breached = getattr(self.orch, "daily_loss_breached", None)
                 if callable(breached):
                     try:
                         if breached():
-                            lines.append("  ⚠️ DAILY LOSS CAP BREACHED — entries halted")
+                            rows.append("🛑 <b>Daily loss cap reached</b> "
+                                        "— new entries halted")
                     except Exception:
                         pass
+                today_block = fmt.lines(*rows)
+
+            life_block = None
             if self.ledger is not None:
                 nets = self.ledger.net_pnls()
-                lines.append(f"lifetime net: {sum(nets):+.4f} USDT "
-                             f"over {len(nets)} closed trades")
-                lines.append(f"fees paid: {self.ledger.total_fees():.4f} USDT")
-            return "\n".join(lines)
+                net = sum(nets)
+                wins = [n for n in nets if n > 0]
+                rows = [f"{fmt.signed_glyph(net if nets else None)} <b>Lifetime</b>",
+                        fmt.plain_row("Net", f"<b>{fmt.money(net, 4)} USDT</b>")]
+                if nets:
+                    rows.append(fmt.plain_row("Trades", str(len(nets))))
+                    rows.append(fmt.plain_row(
+                        "Win rate", fmt.pct(len(wins) / len(nets) * 100)))
+                rows.append(fmt.plain_row(
+                    "Fees", fmt.money(self.ledger.total_fees(), 4, signed=False)
+                            + " USDT"))
+                life_block = fmt.lines(*rows)
+
+            return fmt.join(fmt.title("Profit & Loss", "📊"),
+                            fmt.lines(*open_block), today_block, life_block)
 
         if cmd == "/activity":
             if self.ledger is None:
-                return "no ledger wired"
+                return fmt.join(fmt.title("No ledger", "⚠️"))
             try:
                 limit = max(1, min(20, int(args[0]))) if args else 5
             except ValueError:
@@ -432,28 +570,45 @@ class CommandRouter:
             try:
                 trades = self.ledger.closed_trades(limit=200)
             except Exception as exc:
-                return f"ledger unavailable: {type(exc).__name__}: {exc}"
+                return fmt.join(fmt.title("Activity unavailable", "⚠️"),
+                                fmt.hint(f"{type(exc).__name__}: {exc}"))
             if not trades:
-                return "no closed trades yet"
+                return fmt.join(fmt.title("No closed trades yet", "📭"),
+                                fmt.hint("Completed trades will be listed here."))
             recent = trades[-limit:][::-1]
-            lines = [f"<b>last {len(recent)} closed trades</b>"]
+            cards = []
             for t in recent:
                 sym = t.get("symbol") or t.get("instrument") or "?"
                 net = t.get("net_usd")
-                fee = t.get("fees_usd") or t.get("fee_usd")
-                when = t.get("closed_at") or t.get("ts") or ""
-                mark = "🟢" if (net or 0) >= 0 else "🔴"
-                seg = [f"{mark} <b>{sym}</b>"]
+                fee = t.get("fees_usd") if t.get("fees_usd") is not None \
+                    else t.get("fee_usd")
+                stamp = fmt.when(t.get("closed_at") or t.get("ts") or "")
+                rows = [f"{fmt.signed_glyph(net)} <b>{sym}</b>"
+                        + (f"  <i>{stamp}</i>" if stamp else "")]
                 if net is not None:
-                    seg.append(f"net {float(net):+.4f}")
+                    rows.append(fmt.plain_row("Net",
+                                              f"<b>{fmt.money(net, 4)} USDT</b>"))
                 if fee is not None:
-                    seg.append(f"fee {float(fee):.4f}")
+                    rows.append(fmt.plain_row(
+                        "Fee", fmt.money(fee, 4, signed=False) + " USDT"))
                 if t.get("reason"):
-                    seg.append(str(t["reason"]))
-                lines.append("  ".join(seg) + (f"\n  <i>{when}</i>" if when else ""))
-            return "\n".join(lines)
+                    rows.append(fmt.plain_row("Closed by", str(t["reason"])))
+                cards.append(fmt.lines(*rows))
+            nets = [t.get("net_usd") for t in recent if t.get("net_usd") is not None]
+            footer = fmt.plain_row("Subtotal", f"<b>{fmt.money(sum(nets), 4)}"
+                                               f" USDT</b>") if nets else None
+            return fmt.join(fmt.title(f"Recent activity · {len(recent)}", "🧾"),
+                            *cards,
+                            fmt.lines(fmt.rule(), footer) if footer else None)
 
         if cmd == "/pairs":
             weak = self.shadow.weak_pairs()
-            return ("flagged pairs: " + ", ".join(weak)) if weak else "no flagged pairs"
+            if not weak:
+                return fmt.join(fmt.title("No flagged pairs", "✅"),
+                                fmt.hint("Every tracked pair is performing "
+                                         "within tolerance."))
+            return fmt.join(
+                fmt.title(f"Flagged pairs · {len(weak)}", "🚩"),
+                fmt.lines(*[f"{fmt.BULLET} <code>{w}</code>" for w in weak]),
+                fmt.hint("These pairs underperform in the shadow ledger."))
         return ""
