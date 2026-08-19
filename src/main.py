@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -75,8 +76,12 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
     gate = GoLiveGate(conditions=GateConditions(), config_store=store)
     gate.paper = cfg.paper           # persisted flag wins over anything in code
 
-    whitelist = {s.strip().upper() for s in os.getenv(
-        "SYMBOL_WHITELIST", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip()}
+    # The static SYMBOL_WHITELIST is no longer the gate: a hand-picked list is
+    # exactly what silently dropped the PUMP signal (tradable, just not listed).
+    # Allow-list is now OPT-IN — if SYMBOL_WHITELIST is empty, every symbol that
+    # passes the live tradability check is eligible. An explicit list still works.
+    raw_wl = os.getenv("SYMBOL_WHITELIST", "")
+    whitelist = {s.strip().upper() for s in raw_wl.split(",") if s.strip()}
     symbol_map = SymbolMap(whitelist)
 
     # Private WS (fills + live positions/liq-price) is the contract-correct path
@@ -108,10 +113,18 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
         max_leverage=int(cfg.params.get("max_leverage", 20)),
         equity_usd=float(os.getenv("EQUITY_USD", "100")),
     )
+    # Per-signal affordability: a symbol is eligible when its effective min
+    # notional is actually affordable against live available margin — not because
+    # it happens to be on a hand-picked list. ETH (0.01 * $3100 = $31) fails on a
+    # small account; PUMP ($5 floor) passes. Measured, never assumed.
+    from src.services.tradability import TradabilityChecker
+    tradability = TradabilityChecker(
+        adapter, margin_headroom=0.95, max_leverage=limits.max_leverage,
+        blocklist=set())
     orch = Orchestrator(source, adapter, gate, ledger, notifier=notifier, stream=stream,
                         shadow=shadow, limits=limits, symbol_map=symbol_map,
                         whitelist=whitelist, rate_limit=rate_limit,
-                        private_stream=private_stream)
+                        private_stream=private_stream, tradability=tradability)
     orch.deadman = DeadManSwitch(stream, adapter, orch.positions, notifier,
                                  ttl_s=float(os.getenv("DEADMAN_TTL_S", "60")))
     return orch
@@ -126,6 +139,22 @@ async def cmd_run(args) -> int:
     # CommandRouter + GoLiveGate, so this can never flip to live on its own.
     from src.notifier.telegram import CommandRouter
     from src.notifier.bot_poller import poll_commands, register_bot_commands
+    from src.services.preflight import preflight_venue
+
+    # Venue-state preflight: a misconfigured account (hedge mode -> 40774; or
+    # isolated margin -> liquidation inside the stop) silently breaks entries.
+    # Repair what we can before the first signal, and refuse loudly if we can't.
+    probe = (sorted(orch.whitelist) or ["PUMPUSDT"])[0]
+    preflight = await preflight_venue(orch.adapter, probe, repair=True,
+                                      want_margin_mode="crossed")
+    if not preflight.ok:
+        log.error("VENUE PREFLIGHT FAILED: %s", preflight.summary)
+        if orch.notifier is not None:
+            with contextlib.suppress(Exception):
+                await orch.notifier.send(
+                    f"⚠️ Venue preflight failed — trades may be rejected:\n"
+                    f"{preflight.summary}")
+
     router = CommandRouter(gate=orch.gate, position_manager=orch.positions,
                           shadow_ledger=orch.shadow, ledger=orch.ledger,
                           orchestrator=orch)

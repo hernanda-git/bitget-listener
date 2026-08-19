@@ -18,6 +18,7 @@ Safety contracts implemented here:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -208,23 +209,36 @@ class BitgetAdapter(ExchangeAdapter):
                                                 "symbol": self.venue_symbol(instrument.symbol)})
         if not rows:
             raise BitgetError("NO_SPEC", f"no contract for {instrument.symbol}", P_CONTRACTS)
-        row = {**rows[0], "symbol": instrument.symbol}
-        # Effective minimum notional = max(Bitget's USDT floor, contract-size floor
-        # in USD). The contract-size floor (minTradeNum) only becomes the binding
-        # constraint for expensive coins (e.g. ETH 0.01 * $3100 = $31 >> $5), so the
-        # sizer must see the larger of the two or it will under-size and the exchange
-        # rejects. Price comes from the live ticker (public, cheap).
+        # get_spec_for_symbol does the parsing so a non-Instrument caller (the
+        # tradability check) can resolve a raw ticker string without fabricating
+        # an Instrument.
+        spec = await self.get_spec_for_symbol(instrument.symbol)
+        self._spec_cache[instrument.symbol] = spec
+        return spec
+
+    async def get_spec_for_symbol(self, symbol: str) -> InstrumentSpec:
+        """Resolve a raw symbol string (e.g. from a live signal) to a spec."""
+        rows = await self._public(P_CONTRACTS, {"productType": self.product_type,
+                                                "symbol": self.venue_symbol(symbol)})
+        if not rows:
+            raise BitgetError("NO_SPEC", f"no contract for {symbol}", P_CONTRACTS)
+        row = rows[0]
         min_notional = float(row.get("minTradeUSDT") or 5)
         try:
             tk = await self._public(P_TICKER, {"productType": self.product_type,
-                                               "symbol": self.venue_symbol(instrument.symbol)})
+                                               "symbol": self.venue_symbol(symbol)})
             price = float((tk[0].get("lastPr") or tk[0].get("last") or 0)) if tk else 0.0
-        except Exception:  # never let a price hiccup block spec loading
+        except Exception:
             price = 0.0
         if price > 0:
             min_notional = max(min_notional, float(row["minTradeNum"]) * price)
-        spec = self._parse_spec(row, min_notional=min_notional)
-        self._spec_cache[instrument.symbol] = spec
+        spec = self._parse_spec({**row, "symbol": symbol}, min_notional=min_notional)
+        # Surface the raw status so the tradability check can refuse non-live pairs.
+        _status = str(row.get("symbolStatus") or row.get("status") or "normal").lower()
+        spec = dataclasses.replace(
+            spec, status=_status,
+            tradable=_status in ("normal", "live", "trading", ""))
+        self._spec_cache[symbol] = spec
         return spec
 
     @classmethod
@@ -515,8 +529,14 @@ class BitgetAdapter(ExchangeAdapter):
         return 0.0
 
     async def set_leverage(self, instrument: Instrument, leverage: int,
-                           hold_side: str | None = None) -> None:
+                           hold_side: str | None = None,
+                           cap: int | None = None) -> None:
         spec = await self.get_spec(instrument)
+        # Never use the pair's headline max leverage for a real fill: that was 75x
+        # on PUMP, which produced a 10x fill and a liquidation price inside the
+        # stop-loss. The risk config's max_leverage is the authority.
+        if cap is not None:
+            leverage = min(int(leverage), int(cap))
         lev = max(1, min(int(leverage), spec.max_leverage))
         if self.paper:
             log.info("PAPER set_leverage %s x%d (capped by pair max %d)",

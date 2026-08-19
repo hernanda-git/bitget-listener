@@ -50,7 +50,7 @@ async def test_signal_outside_whitelist_is_skipped():
     await src.push("SOLUSDT LONG entry 150 sl 140")
     await orch.run_once()
     assert fake.placed == []
-    assert "not whitelisted" in orch.skipped[-1]["reason"]
+    assert "not on allow-list" in orch.skipped[-1]["reason"]
 
 
 @pytest.mark.asyncio

@@ -206,7 +206,7 @@ async def test_failed_live_sync_does_not_lose_the_open_position():
         async def get_mark_price(self, instrument):
             return 60_000.0
 
-        async def set_leverage(self, instrument, leverage, hold_side=None):
+        async def set_leverage(self, instrument, leverage, hold_side=None, cap=None):
             return None
 
         async def place_order(self, order):

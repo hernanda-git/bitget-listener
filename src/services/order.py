@@ -104,8 +104,10 @@ class OrderService:
             return {"status": "PAPER", "order": order, "sizing": sized,
                     "client_order_id": client_oid}
 
-        await self.adapter.set_leverage(order.instrument, order.leverage,
-                                        "long" if order.side is Side.BUY else "short")
+        await self.adapter.set_leverage(
+            order.instrument, order.leverage,
+            "long" if order.side is Side.BUY else "short",
+            cap=self.limits.max_leverage)
         order_id = await self.adapter.place_order(order)
         return {"status": "PLACED", "order_id": order_id, "order": order, "sizing": sized,
                 "client_order_id": client_oid}

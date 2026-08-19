@@ -126,7 +126,10 @@ class FakeExchangeAdapter(ExchangeAdapter):
         return self.balance
 
     async def set_leverage(self, instrument: Instrument, leverage: int,
-                           hold_side: str | None = None) -> None:
+                           hold_side: str | None = None,
+                           cap: int | None = None) -> None:
+        if cap is not None:
+            leverage = min(int(leverage), int(cap))
         self.leverage_calls.append((instrument.symbol, leverage))
 
     async def set_trading_stop(self, instrument: Instrument, sl: float | None,

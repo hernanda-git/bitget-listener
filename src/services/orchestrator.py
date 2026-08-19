@@ -36,7 +36,8 @@ class Orchestrator:
                  limits: RiskLimits | None = None, symbol_map=None,
                  whitelist: set[str] | None = None,
                  rate_limit: RateLimitGate | None = None,
-                 private_stream=None) -> None:
+                 private_stream=None,
+                 tradability=None) -> None:
         self.source = source
         self.adapter = adapter
         self.gate = gate
@@ -53,6 +54,8 @@ class Orchestrator:
         self.positions = PositionManager(adapter, self.orders, ledger, stream)
         self.rate_limit = rate_limit or RateLimitGate()
         self.private_stream = private_stream  # BitgetWS(private=True) when creds exist
+        # Per-signal affordability (replaces the brittle static whitelist).
+        self.tradability = tradability
         self.open_trade_ids: dict[str, int] = {}
         self.daily_realized = 0.0
         self.skipped: list[dict] = []
@@ -64,20 +67,27 @@ class Orchestrator:
         """The gate is the single source of truth for paper/live, read per order."""
         self.orders.paper = self.gate.paper
 
-    def guard(self, rs: RawSignal) -> str | None:
+    async def guard(self, rs: RawSignal) -> str | None:
         """Returns a rejection reason, or None when the signal may proceed."""
         if self.deadman is not None and not self.deadman.trading_allowed:
             return "dead-man's switch active (feed stale)"
         if not rs.symbol_usdt:
             return "no symbol parsed"
+        # Static denylist still short-circuits instantly, but we no longer DROP
+        # a tradable symbol just because it wasn't on a hand-picked list.
         if self.whitelist and rs.symbol_usdt not in self.whitelist:
-            return f"{rs.symbol_usdt} not whitelisted"
+            # Whitelist is now opt-IN only: if configured, it still filters.
+            return f"{rs.symbol_usdt} not on allow-list"
         if len(self.positions.positions) >= self.limits.max_concurrent:
             return f"max concurrent positions ({self.limits.max_concurrent}) reached"
         if rs.symbol_usdt in self.positions.positions:
             return f"already in a {rs.symbol_usdt} position"
         if self.daily_loss_breached():
             return "daily loss limit breached"
+        if self.tradability is not None:
+            t = await self.tradability.check(rs.symbol_usdt)
+            if not t.ok:
+                return f"{rs.symbol_usdt} not tradable: {t.detail}"
         return None
 
     def daily_loss_breached(self) -> bool:
@@ -109,7 +119,7 @@ class Orchestrator:
             log.warning("skipping signal: %s", reason)
             return {"status": "SKIPPED", "reason": reason}
 
-        reason = self.guard(rs)
+        reason = await self.guard(rs)
         if reason is not None:
             self.skipped.append({"symbol": rs.symbol_usdt, "reason": reason})
             log.info("skipping signal: %s", reason)

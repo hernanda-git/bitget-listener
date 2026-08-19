@@ -75,6 +75,8 @@ class InstrumentSpec:
     max_leverage: int = 20
     maker_fee: float = 0.0002        # VERIFIED VIP0 USDT-M
     taker_fee: float = 0.0006        # VERIFIED VIP0 USDT-M
+    status: str = "normal"           # raw symbolStatus from the venue
+    tradable: bool = True            # False for suspended/delisted pairs
 
 
 @dataclass
@@ -160,7 +162,7 @@ class Position:
     tp_price: float | None = None
     liq_price: float | None = None    # REAL exchange value; never booked as 0.00 (BUG B)
     unrealized_pnl: float = 0.0
-    margin_mode: str = "isolated"
+    margin_mode: str = "crossed"      # one_way + cross avoids liquidation-inside-stop
     updated_at_ms: int | None = None
 
 
