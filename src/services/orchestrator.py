@@ -328,6 +328,8 @@ class Orchestrator:
             "mode": "PAPER" if self.gate.paper else "LIVE",
             "gate": self.gate.status(),
             "tg_cmd_conflict": bool(bot_poller.tg_cmd_conflict),
+            "tg_cmd_degraded": bool(bot_poller.tg_cmd_degraded()),
+            "tg_cmd_consecutive_errors": int(bot_poller.tg_cmd_consecutive_errors),
             "positions": [
                 {"symbol": p.instrument.symbol, "side": p.side.value, "size": p.size,
                  "entry": p.entry_price, "sl": p.sl_price, "tp": p.tp_price,
