@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 
 from src.domain.model import Instrument, Position, RawSignal, Side, Signal, TradeDecision
@@ -309,6 +310,42 @@ class Orchestrator:
             handled += 1
         return handled
 
+    async def _arm_open_protection(self) -> None:
+        """Startup warmup: arm bot-side SL/TP for open positions that have none,
+        using the trader's intended levels from the ARM_SL_TP env override.
+
+        Format: comma-separated SYMBOL:SL:TP (e.g. "PUMPUSDT:0.002882:0.00337").
+        This is the monitor's PRIMARY enforcement level and works even when the
+        exchange's place-tpsl-order endpoint is unavailable. Open positions that
+        already carry a bot-side level are left untouched.
+        """
+        raw = os.getenv("ARM_SL_TP", "").strip()
+        if not raw:
+            return
+        overrides: dict[str, tuple[float, float]] = {}
+        for chunk in raw.split(","):
+            parts = chunk.strip().split(":")
+            if len(parts) == 3:
+                try:
+                    overrides[parts[0].strip().upper()] = (float(parts[1]), float(parts[2]))
+                except ValueError:
+                    log.warning("ARM_SL_TP bad entry ignored: %s", chunk)
+        if not overrides:
+            return
+        # Make sure we have the current open positions before arming.
+        with contextlib.suppress(Exception):
+            await self.positions.sync()
+        self._track_position_symbols()
+        for sym, (sl, tp) in overrides.items():
+            pos = self.positions.get(sym)
+            if pos is None:
+                continue
+            if pos.sl_price is not None or pos.tp_price is not None:
+                continue
+            log.info("arming bot-side SL/TP for %s from ARM_SL_TP: SL=%s TP=%s", sym, sl, tp)
+            with contextlib.suppress(Exception):
+                await self.positions.modify_stop(sym, sl=sl, tp=tp)
+
     async def start(self) -> None:
         await self.source.start()
         if self.stream is not None:
@@ -329,6 +366,9 @@ class Orchestrator:
         self._task = asyncio.create_task(self._loop())
         self._equity_task = asyncio.create_task(self._equity_sampler())
         self._protection_task = asyncio.create_task(self._protection_sampler())
+        # Arm bot-side SL/TP for any open position lacking it (trader's levels
+        # from ARM_SL_TP). The WS monitor then closes on breach/target.
+        await self._arm_open_protection()
 
     async def _equity_sampler(self) -> None:
         """Periodically append a wallet-equity sample so the dashboard can chart
