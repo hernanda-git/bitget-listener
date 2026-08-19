@@ -278,6 +278,7 @@ class Orchestrator:
         self._running = True
         self._task = asyncio.create_task(self._loop())
         self._equity_task = asyncio.create_task(self._equity_sampler())
+        self._protection_task = asyncio.create_task(self._protection_sampler())
 
     async def _equity_sampler(self) -> None:
         """Periodically append a wallet-equity sample so the dashboard can chart
@@ -290,6 +291,25 @@ class Orchestrator:
                 raise
             except Exception as exc:  # noqa: BLE001 - sampler must never kill the bot
                 log.exception("equity sampler error: %s", exc)
+
+    async def _protection_sampler(self) -> None:
+        """BUG #3: periodically refresh the REAL resting SL/TP for open positions
+        so /api/state (and the dashboard) surface live plan-order protection even
+        though the private WS positions channel does not carry it."""
+        while self._running:
+            try:
+                await asyncio.sleep(getattr(self, "protection_sample_sec", 30))
+                for sym, pos in list(self.positions.positions.items()):
+                    sl, tp = await self.positions._protection(pos.instrument)
+                    if sl is None and tp is None:
+                        continue
+                    self.positions.upsert(Position(**{**pos.__dict__,
+                        "sl_price": sl if sl is not None else pos.sl_price,
+                        "tp_price": tp if tp is not None else pos.tp_price}))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.debug("protection sampler error: %s", exc)
 
     def _record_equity_sample(self) -> None:
         try:
@@ -320,7 +340,8 @@ class Orchestrator:
 
     async def stop(self) -> None:
         self._running = False
-        for tk in (self._task, getattr(self, "_equity_task", None)):
+        for tk in (self._task, getattr(self, "_equity_task", None),
+                   getattr(self, "_protection_task", None)):
             if tk:
                 tk.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):

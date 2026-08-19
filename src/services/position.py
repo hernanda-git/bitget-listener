@@ -42,8 +42,28 @@ class PositionManager:
 
     async def sync(self) -> list[Position]:
         live = await self.adapter.get_positions()
-        self.positions = {p.instrument.symbol: p for p in live if p.size > 0}
+        merged: list[Position] = []
+        for p in live:
+            if p.size > 0:
+                sl, tp = await self._protection(p.instrument)
+                # Only override when the exchange actually reports a level; the
+                # position parse already captured position-level stopLoss/takeProfit,
+                # so this just folds in any live plan orders and never invents one.
+                if sl is not None or tp is not None:
+                    p = Position(**{**p.__dict__,
+                                    "sl_price": sl if sl is not None else p.sl_price,
+                                    "tp_price": tp if tp is not None else p.tp_price})
+            merged.append(p)
+        self.positions = {p.instrument.symbol: p for p in merged if p.size > 0}
         return live
+
+    async def _protection(self, instrument) -> tuple[float | None, float | None]:
+        """Read the REAL resting SL/TP for one symbol (BUG #3 surface)."""
+        try:
+            return await self.adapter.get_protection(instrument)
+        except Exception as exc:
+            log.warning("protection sync failed for %s: %s", instrument.symbol, exc)
+            return None, None
 
     # ---------------------------------------------------------- management verbs
     async def sl_to_entry(self, symbol: str) -> dict:

@@ -460,11 +460,80 @@ class BitgetAdapter(ExchangeAdapter):
             out.append(self._parse_position(row))
         return out
 
+    async def get_protection(self, instrument: Instrument) -> tuple[float | None, float | None]:
+        """Return the REAL resting SL/TP for a symbol, read from the exchange.
+
+        Bug #3 fix: ``/api/state`` must surface the protection that is actually
+        live on the venue, not the bot's local (paper-only) ``sl_price``/``tp_price``.
+        Bitget exposes protection two ways and we merge both:
+
+        * position-level ``stopLoss``/``takeProfit`` (set via the preset / position
+          TP-SL path, ``presetStopLossPrice``), and
+        * pending ``loss_plan`` / ``profit_plan`` orders (the ``place-tpsl-order``
+          path used by ``set_trading_stop``).
+
+        Either source is authoritative; a plan order wins when both exist because
+        it is the explicit, separately-managed stop. Returns ``(sl, tp)`` with
+        ``None`` for any level not actually resting on the exchange.
+        """
+        sym = self.canonical_symbol(instrument.symbol)
+        pos_sl = pos_tp = None
+        try:
+            rows = await self.get_positions()
+            for p in rows:
+                if p.instrument.symbol == sym:
+                    pos_sl, pos_tp = p.sl_price, p.tp_price
+                    break
+        except Exception as exc:
+            log.warning("get_protection position read failed for %s: %s", sym, exc)
+        plan_sl = plan_tp = None
+        try:
+            orders = await self.get_open_orders(instrument)
+            for o in orders:
+                if str(o.get("symbol") or "").upper() != sym.upper():
+                    continue
+                if not self.is_protective(o):
+                    continue
+                px = self._plan_trigger_price(o)
+                if px is None:
+                    continue
+                ptype = str(o.get("planType") or "")
+                if ptype in ("loss_plan", "pos_loss"):
+                    plan_sl = px
+                elif ptype in ("profit_plan", "pos_profit"):
+                    plan_tp = px
+        except Exception as exc:
+            log.warning("get_protection plan-order read failed for %s: %s", sym, exc)
+        sl = plan_sl if plan_sl is not None else pos_sl
+        tp = plan_tp if plan_tp is not None else pos_tp
+        return sl, tp
+
+    @staticmethod
+    def _plan_trigger_price(order: dict) -> float | None:
+        """Extract the trigger price from a Bitget plan/tpsl order row."""
+        raw = order.get("triggerPrice") or order.get("price") or order.get("triggerPriceType")
+        if raw in (None, "", 0):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
     @classmethod
     def _parse_position(cls, row: dict) -> Position:
-        """BUG B: ``liquidationPrice`` is kept REAL — ``None`` if absent, never 0.00."""
+        """BUG B: ``liquidationPrice`` is kept REAL — ``None`` if absent, never 0.00.
+
+        Bug #3: ``stopLoss``/``takeProfit`` are the position-level protective levels
+        (set via the preset path). Empty strings -> ``None`` so the state surface
+        never shows a phantom zero stop. Pending plan orders are merged in via
+        ``get_protection`` (see ``PositionManager.sync``).
+        """
         liq_raw = row.get("liquidationPrice")
         liq = float(liq_raw) if liq_raw not in (None, "", "0", "0.0") else None
+        sl_raw = row.get("stopLoss")
+        tp_raw = row.get("takeProfit")
+        sl = float(sl_raw) if sl_raw not in (None, "", 0) else None
+        tp = float(tp_raw) if tp_raw not in (None, "", 0) else None
         hold = str(row.get("holdSide", "long")).lower()
         return Position(
             instrument=Instrument.from_token(row["symbol"]),
@@ -472,6 +541,8 @@ class BitgetAdapter(ExchangeAdapter):
             size=float(row.get("total") or 0),
             entry_price=float(row.get("openPriceAvg") or row.get("averageOpenPrice") or 0),
             leverage=int(float(row.get("leverage") or 1)),
+            sl_price=sl,
+            tp_price=tp,
             liq_price=liq,
             unrealized_pnl=float(row.get("unrealizedPL") or 0),
             margin_mode=str(row.get("marginMode") or "isolated"),

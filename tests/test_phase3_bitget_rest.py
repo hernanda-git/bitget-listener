@@ -328,6 +328,76 @@ def test_parse_position_zero_liq_becomes_none_not_zero():
         assert pos.side is Side.SELL
 
 
+# ----------------------------------------------------------- BUG #3 protection read
+def test_parse_position_reads_position_level_sl_tp():
+    """BUG #3: position-level stopLoss/takeProfit must be captured (preset path)."""
+    pos = BitgetAdapter._parse_position({
+        "symbol": "PUMPUSDT", "holdSide": "long", "total": "2016",
+        "openPriceAvg": "0.002976", "stopLoss": "0.002882", "takeProfit": "0.00337",
+        "liquidationPrice": "-0.0014"})
+    assert pos.sl_price == 0.002882
+    assert pos.tp_price == 0.00337
+
+
+def test_parse_position_empty_sl_tp_becomes_none():
+    """Empty protective strings must not become a phantom zero stop."""
+    pos = BitgetAdapter._parse_position({
+        "symbol": "PUMPUSDT", "holdSide": "long", "total": "2016",
+        "openPriceAvg": "0.002976", "stopLoss": "", "takeProfit": ""})
+    assert pos.sl_price is None
+    assert pos.tp_price is None
+
+
+@pytest.mark.asyncio
+async def test_get_protection_merges_plan_orders_over_position(monkeypatch):
+    """BUG #3: live loss_plan/profit_plan pending orders are the authoritative SL/TP."""
+    ad = _adapter(paper=False)
+
+    class _Pos:
+        instrument = Instrument.from_token("PUMPUSDT")
+        sl_price = 0.0029    # stale position-level value
+        tp_price = 0.0033
+
+    async def fake_positions():
+        return [_Pos()]
+
+    async def fake_orders(instrument=None):
+        return [
+            {"symbol": "PUMPUSDT", "planType": "loss_plan", "triggerPrice": "0.002882"},
+            {"symbol": "PUMPUSDT", "planType": "profit_plan", "triggerPrice": "0.00337"},
+            # a non-protective entry order must be ignored
+            {"symbol": "PUMPUSDT", "orderType": "limit", "triggerPrice": "0.001"},
+        ]
+
+    monkeypatch.setattr(ad, "get_positions", fake_positions)
+    monkeypatch.setattr(ad, "get_open_orders", fake_orders)
+    sl, tp = await ad.get_protection(Instrument.from_token("PUMPUSDT"))
+    assert sl == 0.002882
+    assert tp == 0.00337
+
+
+@pytest.mark.asyncio
+async def test_get_protection_returns_none_when_no_protection(monkeypatch):
+    """BUG #3: when the exchange reports nothing, surface None (never a fake)."""
+    ad = _adapter(paper=False)
+
+    class _Pos:
+        instrument = Instrument.from_token("PUMPUSDT")
+        sl_price = None
+        tp_price = None
+
+    async def fake_positions():
+        return [_Pos()]
+
+    async def fake_orders(instrument=None):
+        return []
+
+    monkeypatch.setattr(ad, "get_positions", fake_positions)
+    monkeypatch.setattr(ad, "get_open_orders", fake_orders)
+    sl, tp = await ad.get_protection(Instrument.from_token("PUMPUSDT"))
+    assert sl is None and tp is None
+
+
 # ------------------------------------------------------- protective-order filter
 @pytest.mark.parametrize("row", [
     {"reduceOnly": "YES"},

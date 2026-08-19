@@ -86,6 +86,7 @@ def create_app(orchestrator, password: str | None = None) -> FastAPI:
         positions = [
             {"symbol": p["symbol"], "direction": str(p.get("side", "")).upper(),
              "size": p.get("size"), "entry": p.get("entry"),
+             "sl": p.get("sl"), "tp": p.get("tp"),
              "mark": p.get("entry"), "liq_price": p.get("liq"),
              "pnl": p.get("upnl")}
             for p in snap.get("positions", [])
