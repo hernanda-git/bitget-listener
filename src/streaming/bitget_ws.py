@@ -42,6 +42,14 @@ class BitgetWS(MarketStream):
     PUBLIC_URL = "wss://ws.bitget.com/v2/ws/public"
     PRIVATE_URL = "wss://ws.bitget.com/v2/ws/private"
 
+    # When the whitelist is empty we still must subscribe to a REAL symbol or
+    # Bitget rejects an empty subscribe (30002) and sends no ticker frames —
+    # which starves the dead-man's-switch and leaves the bot blind. This sentinel
+    # keeps the feed + watchdog alive. It trades nothing: a fresh-coin signal is
+    # still resolved per-coin via the REST tradability check + adapter.get_mark_price
+    # (see orchestrator), so the sentinel only honest-heartbeats the connection.
+    LIVENESS_SENTINEL = "BTCUSDT"
+
     def __init__(self, symbols: list[str] | None = None, auth=None,
                  product_type: str = "SUSDT-FUTURES", private: bool = False,
                  url: str | None = None, ping_interval: float = 25.0,
@@ -128,13 +136,21 @@ class BitgetWS(MarketStream):
 
     # ------------------------------------------------------------------- frames
     def subscribe_frame(self) -> dict:
-        """The VERIFIED subscribe frame (object args, channel 'ticker')."""
+        """The VERIFIED subscribe frame (object args, channel 'ticker').
+
+        Regression guard (BUG #1, REGRESSION): an empty ``symbols`` list produces
+        ``args: []``, which Bitget rejects with ``30002`` — the subscribe is
+        refused, no ticker frames ever arrive, and the dead-man's-switch goes
+        stale and trips. When the public stream has no symbols we subscribe to the
+        liveness sentinel instead so the feed + watchdog stay alive.
+        """
         if self.private:
             args = [{"instType": self.product_type, "channel": ch, "coin": "default"}
                     for ch in ("orders", "positions", "account")]
         else:
+            syms = self.symbols or [self.LIVENESS_SENTINEL]
             args = [{"instType": self.product_type, "channel": "ticker",
-                     "instId": self.venue_symbol(s)} for s in self.symbols]
+                     "instId": self.venue_symbol(s)} for s in syms]
         return {"op": "subscribe", "args": args}
 
     def login_frame(self) -> dict:

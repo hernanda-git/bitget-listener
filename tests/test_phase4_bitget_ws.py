@@ -305,3 +305,61 @@ async def test_stop_is_idempotent_and_marks_disconnected():
 @pytest.mark.asyncio
 async def test_mark_price_unknown_symbol_is_none():
     assert BitgetWS(symbols=["BTCUSDT"]).mark_price("DOGEUSDT") is None
+
+
+# -------------------------------------------------------------------- BUG #1 regression
+def test_empty_whitelist_public_subscribe_uses_liveness_sentinel():
+    """BUG #1 REGRESSION: empty whitelist must NOT produce `args: []`.
+
+    An empty args list makes Bitget reject the subscribe with 30002, so no
+    ticker frames arrive and the dead-man's-switch starves. A real symbol
+    (the liveness sentinel) must be subscribed instead.
+    """
+    ws = BitgetWS(symbols=[], product_type="USDT-FUTURES")
+    frame = ws.subscribe_frame()
+    assert frame["op"] == "subscribe"
+    assert frame["args"], "empty subscribe args would be rejected by Bitget (30002)"
+    assert frame["args"][0] == {
+        "instType": "USDT-FUTURES", "channel": "ticker",
+        "instId": BitgetWS.LIVENESS_SENTINEL,
+    }
+
+
+def test_empty_whitelist_sentinel_is_the_verified_default_listing():
+    """The sentinel must be a symbol Bitget actually lists on USDT-FUTURES."""
+    ws = BitgetWS(symbols=[], product_type="USDT-FUTURES")
+    sent = ws.subscribe_frame()["args"][0]["instId"]
+    assert sent == "BTCUSDT"
+
+
+def test_whitelist_present_does_not_inject_sentinel():
+    """When the whitelist is non-empty the sentinel must not appear."""
+    ws = BitgetWS(symbols=["PUMPUSDT", "DOGEUSDT"], product_type="USDT-FUTURES")
+    inst_ids = [a["instId"] for a in ws.subscribe_frame()["args"]]
+    assert inst_ids == ["PUMPUSDT", "DOGEUSDT"]
+    assert BitgetWS.LIVENESS_SENTINEL not in inst_ids
+
+
+def test_private_stream_unaffected_by_sentinel_fix():
+    """Private subscribe frames are a fixed channel set and must not change."""
+    ws = BitgetWS(symbols=[], private=True, auth=BitgetAuth("k", "s", "p"))
+    channels = {a["channel"] for a in ws.subscribe_frame()["args"]}
+    assert channels == {"orders", "positions", "account"}
+
+
+@pytest.mark.asyncio
+async def test_empty_whitelist_session_subscribes_sentinel_and_feeds_deadman():
+    """End-to-end: empty whitelist -> WS subscribes BTCUSDT and a ticker frame
+    refreshes last_msg_ts so the dead-man's-switch stays healthy (not stale)."""
+    fake = FakeWS([TICK])
+    ws = BitgetWS(symbols=[], product_type="USDT-FUTURES", connector=connector_for(fake))
+    ready = []
+    ws.on_ready = lambda: ready.append(True)
+    await ws._session()
+    sent = json.loads(fake.sent[0])
+    assert sent["op"] == "subscribe"
+    assert sent["args"][0]["instId"] == "BTCUSDT"
+    # a ticker frame for the sentinel arrived and updated last_msg_ts
+    assert ws.mark_price("BTCUSDT") == 63_111.5
+    assert ws.is_stale(ttl=60) is False
+    assert ready == [True]
