@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.sources.parser import SymbolMap, parse_message, parse_messages
+from src.sources.parser import SymbolMap, parse_message, parse_messages, parse_signals
 from src.sources.telegram import FakeSignalSource, TelethonSource
 
 # The live Bitget USDT-FUTURES set contains BOTH plain and multiplier contracts (VERIFIED).
@@ -72,6 +72,35 @@ def test_management_sl_modify_extracts_price():
     assert rs.is_management is True
     assert rs.management_action == "sl_modify"
     assert rs.raw["mgmt_price"] == 61250.0
+
+
+def test_multi_symbol_line_splits_into_per_symbol_signals():
+    """$INJ 2R up and $PUMP 6R full tp up booking tp1 on both => 2 RawSignals."""
+    sigs = parse_signals("$INJ 2R up and $PUMP 6R full tp up booking tp1 on both")
+    assert len(sigs) == 2
+    syms = {s.symbol_usdt for s in sigs}
+    assert syms == {"INJUSDT", "PUMPUSDT"}
+
+
+def test_r_dialect_inj_2r_up_is_sl_to_entry():
+    sigs = parse_signals("$INJ 2R up")
+    assert len(sigs) == 1
+    assert sigs[0].symbol_usdt == "INJUSDT"
+    assert sigs[0].management_action == "sl_to_entry"
+
+
+def test_r_dialect_pump_6r_tp1_is_partial():
+    sigs = parse_signals("$PUMP 6R full tp up booking tp1 on both")
+    assert len(sigs) == 1
+    assert sigs[0].symbol_usdt == "PUMPUSDT"
+    assert sigs[0].management_action == "partial"
+
+
+def test_r_dialect_requires_r_multiple_not_bare_tp():
+    """An explicit numeric tp modify must NOT be swallowed by the R-dialect."""
+    rs = parse_message("$BTCUSDT tp 0.5")
+    assert rs.management_action == "tp_modify"
+    assert rs.raw["mgmt_price"] == 0.5
 
 
 def test_chatter_does_not_invent_a_symbol():
@@ -164,7 +193,7 @@ async def test_fake_signal_source_replays_messages():
 async def test_fake_signal_source_push():
     src = FakeSignalSource()
     await src.start()
-    rs = await src.push("ETH short entry 2500 sl 2600", message_id=7)
+    rs = (await src.push("ETH short entry 2500 sl 2600", message_id=7))[0]
     assert rs.side == "SELL"
     assert (await src.subscribe().get()).message_id == 7
 
@@ -176,3 +205,47 @@ async def test_telethon_source_refuses_to_start_without_credentials():
     with pytest.raises(RuntimeError) as exc:
         await src.start()
     assert "BLOCKED.md" in str(exc.value)
+
+
+class _FakeMsg:
+    def __init__(self, text, mid, date):
+        self.message = text
+        self.text = text
+        self.id = mid
+        self.date = date
+        self.media = None
+
+
+@pytest.mark.asyncio
+async def test_catch_up_enqueues_management_only_not_entries():
+    """History catch-up must recover missed management calls but never replay
+    old ENTRY signals (that would open stale positions)."""
+    import datetime as _dt
+
+    src = TelethonSource(channel="fattyfatclub", session="s", api_id=1, api_hash="h")
+
+    class _FakeClient:
+        async def get_entity(self, ch):
+            return "entity"
+
+        async def iter_messages(self, entity, limit=None):
+            past = _dt.datetime.now(_dt.timezone.utc).timestamp() - 100
+            for args in [
+                ("$PUMP 6R full tp up booking tp1 on both", 101),
+                ("BTC long entry 63000 sl 61000", 102),
+                ("sl to entry", 103),
+            ]:
+                yield _FakeMsg(args[0], args[1],
+                              _dt.datetime.fromtimestamp(past, _dt.timezone.utc))
+
+    src._client = _FakeClient()
+    captured = []
+    async def _put(rs):
+        captured.append(rs)
+    src.queue.put = _put
+    await src._catch_up(limit=10)
+    syms = {(s.symbol_usdt, s.management_action) for s in captured}
+    assert ("PUMPUSDT", "partial") in syms
+    assert ("", "sl_to_entry") in syms
+    assert all(s.is_management for s in captured), "entry replayed!"
+    assert len([s for s in captured if s.symbol_usdt == "BTCUSDT"]) == 0

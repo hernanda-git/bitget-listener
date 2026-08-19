@@ -22,14 +22,48 @@ _LONG = {"long", "buy", "l", "b"}
 _SHORT = {"short", "sell", "s", "sh"}
 
 # Management action patterns (lowercased). First match wins. Ordered most-specific first.
+# R-dialect: "2R up" / "6R full tp" are trader shorthand — a number followed by "R"
+# means the trade reached that risk-multiple. "up" / "be" => move stop to break-even;
+# "full tp" / "booking tp1" / "tp1 booked" => book partial (tp1).
 _MANAGEMENT = [
     (r"\b(sl to entry|sl be|move sl to be|breakeven|break even)\b", "sl_to_entry"),
-    (r"\b(tp1 booked|tp booked|book partial|partial|partials)\b", "partial"),
+    (r"\b(tp1 booked|tp booked|book partial|partial|partials|booking tp1|tp1)\b", "partial"),
     (r"\b(close full|exit full|full close|closed at entry|cutting|full|closed)\b", "full_close"),
     (r"\b(cancel|void|invalidated|no longer valid)\b", "cancel_pending"),
-    (r"\btp[123]?\s*[:<=>]?\s*[\$]?([\d.]+)\b", "tp_modify"),
-    (r"\bsl\s*[:<=>]?\s*[\$]?([\d.]+)\b", "sl_modify"),
+    (r"\btp[123]?\s+[\$]?(\d+(?:\.\d+)?)\b", "tp_modify"),
+    (r"\bsl\s+[\$]?(\d+(?:\.\d+)?)\b", "sl_modify"),
 ]
+
+# R-multiple shorthand: "<n>R" near a ticker. "up"/"be" => break-even; "full tp"/
+# "booking tp1" present => partial. Standalone "nR" with no other clue => sl_to_entry
+# (lock profit at entry and let it run), matching the trader's "2R up" idiom.
+_R_MULTIPLE = re.compile(r"(\d+(?:\.\d+)?)\s*R\b", re.IGNORECASE)
+
+
+def _r_dialect_action(clause: str) -> str | None:
+    """Map an R-based management clause to a concrete action.
+
+    Only fires when the clause actually carries an R-multiple ("2R", "6R"), so an
+    explicit numeric modify like "$BTC tp 0.5" is NOT mistaken for a partial.
+
+    ``$INJ 2R up``      -> sl_to_entry (lock BE, let it run)
+    ``$PUMP 6R ... tp1`` -> partial      (book tp1)
+    ``$X 3R full``      -> full_close
+    """
+    if not _R_MULTIPLE.search(clause):
+        return None
+    low = clause.lower()
+    # A numeric price right after tpN/sl ("tp1 3350", "sl 61250") is an explicit
+    # modify, NOT a partial/close — bail so the numeric handler picks it up.
+    if re.search(r"(?:tp[123]?|sl)\s*[:<=>]?\s*[\$]?\s*\d", low):
+        return None
+    has_partial = bool(re.search(r"tp1|booking tp|full tp|partial|book", low))
+    has_full = bool(re.search(r"\bfull close\b|\bexit full\b|\bfull\b.*\bclose\b", low))
+    if has_full:
+        return "full_close"
+    if has_partial:
+        return "partial"
+    return "sl_to_entry"
 
 _NUM_KEY_RE = re.compile(
     r"(entry|entry price|ep|sl|stoploss|stop loss|tp|takeprofit|take profit|"
@@ -106,16 +140,33 @@ def _side(text: str) -> str | None:
 
 def _management_action(text: str) -> tuple[str, dict] | None:
     low = text.lower()
+    # 1) Numeric modifies — only when an actual price follows (tp 0.5 / sl 61250 /
+    # tp1 3350). Requiring the digit+separator keeps "tp1 booked" out of here.
     for pat, action in _MANAGEMENT:
+        if action not in ("tp_modify", "sl_modify"):
+            continue
         m = re.search(pat, low)
         if m:
             extra: dict = {}
-            if action in ("tp_modify", "sl_modify") and m.groups():
+            if m.groups():
                 try:
                     extra["price"] = float(m.group(1))
                 except (ValueError, TypeError):
                     pass
             return action, extra
+    # 2) R-dialect: "$INJ 2R up" / "$PUMP 6R full tp booking tp1" carry no
+    # literal "sl to entry" but mean exactly that (or partial/full).
+    r_action = _r_dialect_action(text)
+    if r_action is not None:
+        return r_action, {}
+    # 3) The remaining literal management verbs (sl_to_entry / partial / full_close
+    # / cancel_pending).
+    for pat, action in _MANAGEMENT:
+        if action in ("tp_modify", "sl_modify"):
+            continue
+        m = re.search(pat, low)
+        if m:
+            return action, {}
     return None
 
 
@@ -132,10 +183,34 @@ def _extract_num_map(text: str) -> dict[str, float]:
     return out
 
 
-def parse_message(text: str, message_id: int | None = None, ts_ms: int | None = None,
+def _split_multi_symbol(text: str) -> list[str]:
+    """Split a multi-symbol line into per-symbol clauses.
+
+    e.g. "$INJ 2R up and $PUMP 6R full tp up booking tp1 on both"
+      -> ["$INJ 2R up", "$PUMP 6R full tp up booking tp1 on both"]
+    Each clause keeps the trailing context ("on both") which is harmless and
+    lets the R-dialect matcher see "tp1"/"full" for the last symbol.
+    """
+    ticks = list(re.finditer(r"\$[A-Za-z0-9]{2,14}|[A-Za-z0-9]{2,14}USDT", text, re.IGNORECASE))
+    if len(ticks) <= 1:
+        return [text]
+    clauses = []
+    prev = 0
+    for i, t in enumerate(ticks):
+        end = ticks[i + 1].start() if i + 1 < len(ticks) else len(text)
+        clauses.append(text[prev:end].strip())
+        prev = end
+    return [c for c in clauses if c]
+
+
+def parse_signals(text: str, message_id: int | None = None, ts_ms: int | None = None,
                   source: str = "fattyfatclub", channel: str = "",
-                  symbol_map: SymbolMap | None = None) -> RawSignal:
-    """Parse a channel message into a ``RawSignal``.
+                  symbol_map: SymbolMap | None = None) -> list[RawSignal]:
+    """Parse a channel message into one or more ``RawSignal`` (one per symbol).
+
+    A line can reference several coins with per-symbol management (e.g.
+    "$INJ 2R up and $PUMP 6R full tp up booking tp1 on both"). Each symbol becomes
+    its own RawSignal so the pipeline acts on every one of them.
 
     A message carrying BOTH a side and an entry price is an ENTRY, even when it also
     lists sl/tp — otherwise every real signal would be misrouted to the management
@@ -143,44 +218,61 @@ def parse_message(text: str, message_id: int | None = None, ts_ms: int | None = 
     """
     smap = symbol_map or _DEFAULT_MAP
     text = (text or "").strip()
-    raw: dict[str, object] = {"text": text}
+    clauses = _split_multi_symbol(text)
+    results: list[RawSignal] = []
+    for clause in clauses:
+        raw: dict[str, object] = {"text": clause}
+        sym = _find_symbol(clause)
+        side = _side(clause)
+        chosen_side: Literal["BUY", "SELL"] = side or "BUY"  # type: ignore[assignment]
+        nums = _extract_num_map(clause)
 
-    sym = _find_symbol(text)
-    side = _side(text)
-    chosen_side: Literal["BUY", "SELL"] = side or "BUY"  # type: ignore[assignment]
-    nums = _extract_num_map(text)
+        mgmt = _management_action(clause)
+        is_entry = side is not None and nums.get("entry") is not None
+        if is_entry:
+            mgmt = None
 
-    mgmt = _management_action(text)
-    is_entry = side is not None and nums.get("entry") is not None
-    if is_entry:
-        mgmt = None
+        inst = smap.resolve(sym) if sym else Instrument(symbol="", base="", quote="USDT")
 
-    inst = smap.resolve(sym) if sym else Instrument(symbol="", base="", quote="USDT")
+        rs = RawSignal(
+            symbol_usdt=inst.symbol,
+            base=inst.base,
+            side=chosen_side,
+            entry=nums.get("entry"),
+            sl=nums.get("sl"),
+            tp=nums.get("tp"),
+            notional_usd=nums.get("size", 0.0) or nums.get("risk", 0.0),
+            leverage=int(nums.get("leverage", 1) or 1),
+            confidence=min(1.0, max(0.0, nums.get("confidence", 0.0))),
+            raw=raw,
+            source=source,
+            message_id=message_id,
+            ts_ms=ts_ms,
+            channel=channel,
+            raw_text=clause,
+            is_management=mgmt is not None,
+            management_action=mgmt[0] if mgmt else None,
+        )
+        if mgmt:
+            raw["mgmt_price"] = mgmt[1].get("price")
+            raw["mgmt_symbol"] = inst.symbol or None
+        results.append(rs)
+    return results
 
-    rs = RawSignal(
-        symbol_usdt=inst.symbol,
-        base=inst.base,
-        side=chosen_side,
-        entry=nums.get("entry"),
-        sl=nums.get("sl"),
-        tp=nums.get("tp"),
-        notional_usd=nums.get("size", 0.0) or nums.get("risk", 0.0),
-        leverage=int(nums.get("leverage", 1) or 1),
-        confidence=min(1.0, max(0.0, nums.get("confidence", 0.0))),
-        raw=raw,
-        source=source,
-        message_id=message_id,
-        ts_ms=ts_ms,
-        channel=channel,
-        raw_text=text,
-        is_management=mgmt is not None,
-        management_action=mgmt[0] if mgmt else None,
-    )
-    if mgmt:
-        raw["mgmt_price"] = mgmt[1].get("price")
-        raw["mgmt_symbol"] = inst.symbol or None
-    return rs
+
+def parse_message(text: str, message_id: int | None = None, ts_ms: int | None = None,
+                  source: str = "fattyfatclub", channel: str = "",
+                  symbol_map: SymbolMap | None = None) -> RawSignal:
+    """Backward-compatible single-symbol parse. Returns the first RawSignal.
+
+    For multi-symbol lines use ``parse_signals`` (returns one per symbol).
+    """
+    return parse_signals(text, message_id=message_id, ts_ms=ts_ms, source=source,
+                         channel=channel, symbol_map=symbol_map)[0]
 
 
 def parse_messages(items: Iterable[str], **kw) -> list[RawSignal]:
-    return [parse_message(t, **kw) for t in items]
+    out: list[RawSignal] = []
+    for t in items:
+        out.extend(parse_signals(t, **kw))
+    return out

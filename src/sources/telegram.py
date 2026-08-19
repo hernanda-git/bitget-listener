@@ -12,7 +12,7 @@ import os
 
 from src.domain.model import RawSignal
 from src.interfaces.ports import SignalSource
-from src.sources.parser import SymbolMap, parse_message
+from src.sources.parser import SymbolMap, parse_signals
 
 log = logging.getLogger(__name__)
 
@@ -30,8 +30,8 @@ class FakeSignalSource(SignalSource):
     async def start(self) -> None:
         self.started = True
         for i, text in enumerate(self.messages, start=1):
-            await self.queue.put(parse_message(text, message_id=i,
-                                               symbol_map=self.symbol_map))
+            for rs in parse_signals(text, message_id=i, symbol_map=self.symbol_map):
+                await self.queue.put(rs)
 
     async def stop(self) -> None:
         self.started = False
@@ -39,10 +39,11 @@ class FakeSignalSource(SignalSource):
     def subscribe(self) -> asyncio.Queue:
         return self.queue
 
-    async def push(self, text: str, message_id: int | None = None) -> RawSignal:
-        rs = parse_message(text, message_id=message_id, symbol_map=self.symbol_map)
-        await self.queue.put(rs)
-        return rs
+    async def push(self, text: str, message_id: int | None = None) -> list[RawSignal]:
+        sigs = parse_signals(text, message_id=message_id, symbol_map=self.symbol_map)
+        for rs in sigs:
+            await self.queue.put(rs)
+        return sigs
 
 
 class TelethonSource(SignalSource):
@@ -81,14 +82,56 @@ class TelethonSource(SignalSource):
 
         @self._client.on(events.NewMessage(chats=self.channel))
         async def _handler(event):    # pragma: no cover - requires a live session
-            rs = parse_message(event.raw_text, message_id=event.id,
-                               ts_ms=int(event.date.timestamp() * 1000),
-                               channel=self.channel, symbol_map=self.symbol_map)
-            rs.has_media = bool(event.media)
-            await self.queue.put(rs)
+            for rs in parse_signals(event.raw_text, message_id=event.id,
+                                    ts_ms=int(event.date.timestamp() * 1000),
+                                    channel=self.channel, symbol_map=self.symbol_map):
+                rs.has_media = bool(event.media)
+                await self.queue.put(rs)
 
         await self._client.start()
         log.info("TelethonSource listening on @%s", self.channel)
+        # History catch-up: process signals posted before we connected (or read
+        # from history) so a management call while the bot was down is not missed.
+        # Only messages OLDER than connect time are enqueued; live NewMessage
+        # events handle everything newer, avoiding duplicate processing.
+        await self._catch_up()
+
+    async def _catch_up(self, limit: int | None = None) -> None:
+        limit = limit or int(os.getenv("TG_CATCHUP", "50"))
+        if limit <= 0 or self._client is None:
+            return
+        try:
+            entity = await self._client.get_entity(self.channel)
+        except Exception as exc:  # noqa: BLE001 - channel resolution must not kill startup
+            log.warning("catch-up: could not resolve channel %s (%s) — skipping",
+                        self.channel, exc)
+            return
+        started_at = __import__("time").time()
+        seen = 0
+        try:
+            async for msg in self._client.iter_messages(entity, limit=limit):
+                # Only process messages that arrived before this session started.
+                if msg.date is not None and msg.date.timestamp() >= started_at:
+                    continue
+                text = msg.message or (msg.text or "")
+                if not text.strip():
+                    continue
+                for rs in parse_signals(text, message_id=msg.id,
+                                        ts_ms=int(msg.date.timestamp() * 1000) if msg.date else None,
+                                        channel=self.channel, symbol_map=self.symbol_map):
+                    # Catch-up exists to recover MISSED MANAGEMENT calls (sl/close/tp)
+                    # posted while the bot was down. Replaying old ENTRY signals would
+                    # open stale positions, so only management is processed here.
+                    if not rs.is_management:
+                        continue
+                    rs.has_media = bool(msg.media)
+                    await self.queue.put(rs)
+                    seen += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("catch-up scan failed (%s) — continuing with live only", exc)
+            return
+        if seen:
+            log.info("catch-up enqueued %d historical signal(s)", seen)
 
     async def stop(self) -> None:
         if self._client is not None:

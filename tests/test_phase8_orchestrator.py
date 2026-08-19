@@ -188,8 +188,8 @@ async def test_bare_management_is_ignored_when_two_positions_open():
     fake, orch, *_ = build(paper=False)
     orch.positions.upsert(fake.seed_position(symbol="BTCUSDT"))
     orch.positions.upsert(fake.seed_position(symbol="ETHUSDT"))
-    res = await orch.handle_management(
-        __import__("src.sources.parser", fromlist=["parse_message"]).parse_message("sl to entry"))
+    sigs = __import__("src.sources.parser", fromlist=["parse_signals"]).parse_signals("sl to entry")
+    res = await orch.handle_management(sigs[0])
     assert res["status"] == "NO_POSITION"
 
 
