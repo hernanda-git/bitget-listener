@@ -57,6 +57,36 @@ def tg_cmd_degraded() -> bool:
     return bool(tg_cmd_conflict) or tg_cmd_consecutive_errors >= DEGRADED_AFTER_ERRORS
 
 
+async def register_bot_commands(router) -> bool:
+    """Publish the command list via setMyCommands so Telegram's "/" popup shows it.
+
+    This is what makes typing a bare "/" in the chat render a tappable menu.
+    Best-effort: a failure here must never stop the bot from trading, so it is
+    logged and swallowed. Descriptions are capped at Telegram's 256-char limit
+    and names must be lowercase a-z/0-9/_ (the API rejects anything else).
+    """
+    token = os.getenv("TG_BOT_TOKEN", "")
+    if not token:
+        return False
+    cmds = [{"command": name, "description": (f"{desc} — args: {args}" if args
+                                              else desc)[:256]}
+            for name, args, desc, _ in router.COMMANDS]
+    try:
+        client = await get_client()
+        r = await client.post(
+            f"https://api.telegram.org/bot{token}/setMyCommands",
+            json={"commands": cmds}, timeout=REQUEST_TIMEOUT_S)
+        data = r.json()
+        if data.get("ok"):
+            log.warning("[tg-cmd] registered %d commands with Telegram "
+                        "(the \"/\" menu is live)", len(cmds))
+            return True
+        log.error("[tg-cmd] setMyCommands rejected: %s", data)
+    except Exception as exc:
+        log.error("[tg-cmd] setMyCommands failed: %s: %s", type(exc).__name__, exc)
+    return False
+
+
 async def poll_commands(router: CommandRouter, stop: asyncio.Event | None = None) -> None:
     global tg_cmd_conflict, tg_cmd_consecutive_errors
     token = os.getenv("TG_BOT_TOKEN", "")

@@ -125,9 +125,12 @@ async def cmd_run(args) -> int:
     # @fattyfatclub listener and of the notifier sender. Commands are gated by
     # CommandRouter + GoLiveGate, so this can never flip to live on its own.
     from src.notifier.telegram import CommandRouter
-    from src.notifier.bot_poller import poll_commands
+    from src.notifier.bot_poller import poll_commands, register_bot_commands
     router = CommandRouter(gate=orch.gate, position_manager=orch.positions,
-                          shadow_ledger=orch.shadow, ledger=orch.ledger)
+                          shadow_ledger=orch.shadow, ledger=orch.ledger,
+                          orchestrator=orch)
+    # Publish the command menu so Telegram's "/" popup lists them natively.
+    await register_bot_commands(router)
     poller_task = asyncio.create_task(poll_commands(router))
 
     log.warning("starting in %s mode (product_type=%s)",
