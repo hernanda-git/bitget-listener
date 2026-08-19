@@ -190,7 +190,11 @@ class BitgetWS(MarketStream):
                 if isinstance(resp, dict) and resp.get("event") == "error":
                     raise RuntimeError(f"WS login rejected: {resp}")
             await self.rate_limit.acquire("ws")
-            await ws.send(json.dumps(self.subscribe_frame()))
+            sub = self.subscribe_frame()
+            await ws.send(json.dumps(sub))
+            log.info("WS %s subscribed %s", self.url,
+                     [a.get("instId") for a in sub.get("args", [])]
+                     if not self.private else [a.get("channel") for a in sub.get("args", [])])
             self.connected = True
             self.last_msg_ts = time.time()
             await self._emit(self.on_ready)
