@@ -213,6 +213,7 @@ class Orchestrator:
         """Deterministic management fast path — no LLM, milliseconds."""
         action = rs.management_action
         symbol = rs.symbol_usdt or self._only_open_symbol()
+        log.info("management signal: %s action=%s", symbol or "(none)", action)
         if symbol is None:
             return {"status": "NO_POSITION", "action": action}
         self._sync_paper_flag()
