@@ -620,9 +620,25 @@ class BitgetAdapter(ExchangeAdapter):
         await self._signed("POST", P_SET_LEVERAGE, body=body)
 
     async def set_trading_stop(self, instrument: Instrument, sl: float | None,
-                               tp: float | None, size: float | None = None) -> None:
-        """Attach/modify protective levels post-open via plan orders."""
+                               tp: float | None, size: float | None = None,
+                               hold_side: str | None = None,
+                               margin_mode: str | None = None) -> None:
+        """Attach/modify protective levels post-open via plan orders.
+
+        Bitget requires ``holdSide`` (the position direction) on the tpsl endpoint,
+        and ``marginMode`` must match the position's actual mode (crossed/isolated)
+        or the order is rejected. Both are derived from the live position when not
+        supplied, so callers (auto-protect on open, /sl_modify) don't have to pass them.
+        """
         spec = await self.get_spec(instrument)
+        if hold_side is None or margin_mode is None:
+            live = next((p for p in await self.get_positions()
+                         if p.instrument.symbol == instrument.symbol), None)
+            if live is not None:
+                hold_side = hold_side or ("long" if live.side is Side.BUY else "short")
+                margin_mode = margin_mode or live.margin_mode
+        hold_side = (hold_side or "long").lower()
+        margin_mode = margin_mode or "crossed"
         for price, plan in ((sl, "loss_plan"), (tp, "profit_plan")):
             if price is None:
                 continue
@@ -630,7 +646,8 @@ class BitgetAdapter(ExchangeAdapter):
                 log.info("PAPER set_trading_stop %s %s @ %s", instrument.symbol, plan, price)
                 continue
             body = {"symbol": self.venue_symbol(instrument.symbol), "productType": self.product_type,
-                    "marginMode": "isolated", "marginCoin": self.margin_coin,
+                    "marginMode": margin_mode, "marginCoin": self.margin_coin,
+                    "holdSide": hold_side,
                     "planType": plan, "triggerPrice": str(self.round_price(spec, price)),
                     "triggerType": "mark_price",
                     "clientOid": self.new_client_oid("bgp")}

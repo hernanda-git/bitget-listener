@@ -131,6 +131,22 @@ async def test_live_mode_places_a_real_order():
 
 
 @pytest.mark.asyncio
+async def test_live_open_auto_attaches_signal_sl_tp_as_protection():
+    """(a) BUG #3 fix + protection: a live fill must place the trader's EXACT
+    SL/TP as resting plan orders, never leaving a naked position."""
+    fake, orch, gate, ledger, _ = build(paper=False)
+    await orch.source.start()
+    await orch.source.push(LONG, message_id=6)   # BTCUSDT sl 57000 tp 66000
+    await orch.run_once()
+    # exactly one entry order
+    assert len(fake.placed) == 1
+    # and the protection was attached via set_trading_stop with the signal's levels
+    assert fake.stops and fake.stops[-1][0] == "BTCUSDT"
+    assert fake.stops[-1][1] == 57_000.0   # SL
+    assert fake.stops[-1][2] == 66_000.0   # TP
+
+
+@pytest.mark.asyncio
 async def test_paper_flag_is_read_from_the_gate_per_order():
     """A mid-session /paper must take effect on the very next signal."""
     fake, orch, gate, ledger, _ = build(paper=False)

@@ -165,6 +165,33 @@ class Orchestrator:
             except Exception as exc:
                 log.error("position sync failed after open (%s) — keeping local view", exc)
                 self._local_position(order)
+            # Place the trader's EXACT SL/TP as resting plan orders (BUG C:
+            # reduce-only, never auto-cancelled). A fill without protection is a
+            # naked position; the signal's stop/target is authoritative.
+            if (order.sl is not None or order.tp is not None):
+                try:
+                    existing = self.positions.get(order.instrument.symbol)
+                    pos = Position(
+                        instrument=order.instrument, side=order.side, size=order.qty,
+                        entry_price=order.price or 0.0, leverage=order.leverage,
+                        margin_mode=order.margin_mode,
+                        sl_price=existing.sl_price if existing else None,
+                        tp_price=existing.tp_price if existing else None,
+                    )
+                    plan = await self.orders.attach_protective(pos, order.sl, order.tp)
+                    if self.notifier is not None:
+                        with contextlib.suppress(Exception):
+                            await self.notifier.send(
+                                f"PROTECTION {order.instrument.symbol}: "
+                                f"SL={order.sl} TP={order.tp} ({plan.get('status')})")
+                except Exception as exc:
+                    log.error("attach_protective failed after open (%s) — position is "
+                              "NAKED, operator must set stops manually", exc)
+                    if self.notifier is not None:
+                        with contextlib.suppress(Exception):
+                            await self.notifier.send(
+                                f"WARNING {order.instrument.symbol} opened WITHOUT stops "
+                                f"(attach failed: {exc}). Set SL/TP manually.")
         if self.notifier is not None:
             with contextlib.suppress(Exception):
                 await self.notifier.send(TelegramNotifier.format_entry(result))
