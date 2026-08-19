@@ -126,6 +126,52 @@ def test_parse_spec_handles_high_multiplier_contract():
     assert spec.min_qty == 1000.0
 
 
+def test_parse_spec_honours_effective_min_notional_override():
+    """The caller may pass the computed effective floor; it must win over minTradeUSDT."""
+    spec = BitgetAdapter._parse_spec(CONTRACT_BTC, min_notional=31.0)
+    assert spec.min_notional == pytest.approx(31.0)
+    # and without the override the published USDT floor is still used
+    assert BitgetAdapter._parse_spec(CONTRACT_BTC).min_notional == pytest.approx(5.0)
+
+
+CONTRACT_ETH = {
+    "symbol": "ETHUSDT", "makerFeeRate": "0.0002", "takerFeeRate": "0.0006",
+    "minTradeNum": "0.01", "volumePlace": "2", "pricePlace": "2",
+    "sizeMultiplier": "0.01", "minTradeUSDT": "5", "maxLever": "100",
+}
+
+
+async def test_get_spec_computes_effective_min_notional_from_ticker(monkeypatch):
+    """ETH: minTradeNum 0.01 * $3100 = $31 is the BINDING floor, not the $5 minTradeUSDT."""
+    ad = BitgetAdapter(product_type="USDT-FUTURES")
+    calls = []
+
+    async def fake_public(path, params=None):
+        calls.append(path)
+        if "contracts" in path:
+            return [dict(CONTRACT_ETH)]
+        return [{"symbol": "ETHUSDT", "lastPr": "3100.0"}]
+
+    monkeypatch.setattr(ad, "_public", fake_public)
+    spec = await ad.get_spec(Instrument.from_token("ETH"))
+    assert spec.min_notional == pytest.approx(31.0)
+    assert any("ticker" in p for p in calls)
+
+
+async def test_get_spec_falls_back_to_five_when_ticker_fails(monkeypatch):
+    """A price hiccup must never block spec loading."""
+    ad = BitgetAdapter(product_type="USDT-FUTURES")
+
+    async def fake_public(path, params=None):
+        if "contracts" in path:
+            return [dict(CONTRACT_ETH)]
+        raise RuntimeError("ticker down")
+
+    monkeypatch.setattr(ad, "_public", fake_public)
+    spec = await ad.get_spec(Instrument.from_token("ETH"))
+    assert spec.min_notional == pytest.approx(5.0)
+
+
 def test_step_from_places():
     assert BitgetAdapter._step_from_places(0) == 1
     assert BitgetAdapter._step_from_places(4) == pytest.approx(0.0001)

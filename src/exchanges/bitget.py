@@ -208,12 +208,27 @@ class BitgetAdapter(ExchangeAdapter):
                                                 "symbol": self.venue_symbol(instrument.symbol)})
         if not rows:
             raise BitgetError("NO_SPEC", f"no contract for {instrument.symbol}", P_CONTRACTS)
-        spec = self._parse_spec({**rows[0], "symbol": instrument.symbol})
+        row = {**rows[0], "symbol": instrument.symbol}
+        # Effective minimum notional = max(Bitget's USDT floor, contract-size floor
+        # in USD). The contract-size floor (minTradeNum) only becomes the binding
+        # constraint for expensive coins (e.g. ETH 0.01 * $3100 = $31 >> $5), so the
+        # sizer must see the larger of the two or it will under-size and the exchange
+        # rejects. Price comes from the live ticker (public, cheap).
+        min_notional = float(row.get("minTradeUSDT") or 5)
+        try:
+            tk = await self._public(P_TICKER, {"productType": self.product_type,
+                                               "symbol": self.venue_symbol(instrument.symbol)})
+            price = float((tk[0].get("lastPr") or tk[0].get("last") or 0)) if tk else 0.0
+        except Exception:  # never let a price hiccup block spec loading
+            price = 0.0
+        if price > 0:
+            min_notional = max(min_notional, float(row["minTradeNum"]) * price)
+        spec = self._parse_spec(row, min_notional=min_notional)
         self._spec_cache[instrument.symbol] = spec
         return spec
 
     @classmethod
-    def _parse_spec(cls, row: dict) -> InstrumentSpec:
+    def _parse_spec(cls, row: dict, min_notional: float | None = None) -> InstrumentSpec:
         """Decode the VERIFIED contract shape into step sizes."""
         return InstrumentSpec(
             symbol=row["symbol"],
@@ -221,7 +236,8 @@ class BitgetAdapter(ExchangeAdapter):
             qty_step=cls._step_from_places(row["volumePlace"]),
             min_qty=float(row["minTradeNum"]),
             size_multiplier=float(row.get("sizeMultiplier") or row["minTradeNum"]),
-            min_notional=float(row.get("minTradeUSDT") or 5),
+            min_notional=min_notional if min_notional is not None
+                         else float(row.get("minTradeUSDT") or 5),
             max_leverage=int(float(row.get("maxLever") or 20)),
             maker_fee=float(row.get("makerFeeRate") or 0.0002),
             taker_fee=float(row.get("takerFeeRate") or 0.0006),
