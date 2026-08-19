@@ -269,6 +269,22 @@ def test_on_position_marks_the_liq_price_condition_and_tracks():
 
 
 @pytest.mark.asyncio
+async def test_on_position_preserves_bot_side_protection():
+    """The private WS positions channel does not carry our monitor-side SL/TP,
+    so an incoming position push must not wipe bot-side levels already set."""
+    fake, orch, gate, *_ = build(paper=False)
+    await orch.positions.sync()
+    armed = fake.seed_position()
+    armed.sl_price = 57_000.0
+    armed.tp_price = 66_000.0
+    orch.positions.upsert(armed)
+    raw = fake.seed_position()  # raw push carries no SL/TP
+    orch.on_position(raw)
+    kept = orch.positions.get("BTCUSDT")
+    assert kept.sl_price == 57_000.0 and kept.tp_price == 66_000.0
+
+
+@pytest.mark.asyncio
 async def test_on_tick_enforces_the_stop():
     fake, orch, *_ = build(paper=False)
     pos = fake.seed_position(entry=60_000.0)

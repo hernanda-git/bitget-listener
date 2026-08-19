@@ -277,6 +277,15 @@ class Orchestrator:
 
     def on_position(self, position) -> None:
         self.gate.observe_position(position)
+        # Preserve bot-side SL/TP: the private WS positions channel does NOT carry
+        # our monitor-side levels, so a raw upsert would wipe them on every push.
+        # Only adopt the incoming level when it is actually present.
+        existing = self.positions.get(position.instrument.symbol)
+        if existing is not None:
+            if position.sl_price is None and existing.sl_price is not None:
+                position = Position(**{**position.__dict__, "sl_price": existing.sl_price})
+            if position.tp_price is None and existing.tp_price is not None:
+                position = Position(**{**position.__dict__, "tp_price": existing.tp_price})
         self.positions.upsert(position)
         self._track_position_symbols()
 
