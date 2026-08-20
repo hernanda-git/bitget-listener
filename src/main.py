@@ -229,6 +229,10 @@ async def cmd_go_live(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import faulthandler
+    faulthandler.enable()
+    # Auto-dump the Python traceback if startup ever spins (diagnostic).
+    faulthandler.dump_traceback_later(8, exit=False, file=sys.stderr)
     load_env()
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO"),
