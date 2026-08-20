@@ -71,6 +71,10 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
         rate_limit=rate_limit,
     )
     ledger = PostgresLedger()
+    # Self-heal the shared schema on every start (idempotent; cheap).
+    from bot_common import ensure_schema
+    with contextlib.suppress(Exception):
+        ensure_schema()
     shadow = ShadowLedger(LedgerEvalStore(ledger),
                           min_trades=int(os.getenv("SHADOW_MIN_TRADES", "30")),
                           auto_downsize=os.getenv("AUTO_DOWNSIZE", "0") == "1")
