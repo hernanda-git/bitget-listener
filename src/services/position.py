@@ -11,15 +11,41 @@ BUG B is closed here: a liquidation is booked at the position's REAL
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+from pathlib import Path
 
 from src.domain.model import Fill, Position, Side
 
 log = logging.getLogger(__name__)
 
+# Bot-side SL/TP armed levels are not resting on the venue (the exchange tpsl
+# endpoint rejects them for this account), so they live ONLY in memory. Persist
+# them to disk so a process restart re-arms the monitor instead of going naked.
+ARMED_STOPS_PATH = os.getenv("ARMED_STOPS_PATH",
+                              str(Path(os.getenv("STATE_DIR", ".")) / "armed_stops.json"))
+
 
 class LiquidationPriceUnknown(RuntimeError):
     """Raised rather than silently booking a liquidation at 0.00 (BUG B)."""
+
+
+def _load_armed_stops() -> dict[str, dict]:
+    try:
+        with open(ARMED_STOPS_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_armed_stops(stops: dict[str, dict]) -> None:
+    try:
+        Path(ARMED_STOPS_PATH).parent.mkdir(parents=True, exist_ok=True)
+        with open(ARMED_STOPS_PATH, "w", encoding="utf-8") as fh:
+            json.dump(stops, fh)
+    except OSError as exc:
+        log.warning("could not persist armed stops to %s: %s", ARMED_STOPS_PATH, exc)
 
 
 class PositionManager:
@@ -29,6 +55,8 @@ class PositionManager:
         self.ledger = ledger
         self.stream = stream
         self.positions: dict[str, Position] = {}
+        # Symbol -> {"sl": float|None, "tp": float|None} persisted across restarts.
+        self._armed: dict[str, dict] = _load_armed_stops()
 
     # ------------------------------------------------------------------ tracking
     def upsert(self, position: Position) -> None:
@@ -94,6 +122,8 @@ class PositionManager:
         # unavailable: set the local level FIRST so the WS monitor protects even
         # if the venue attachment fails.
         self.upsert(Position(**{**pos.__dict__, "sl_price": new_sl}))
+        self._armed[symbol.upper()] = {"sl": new_sl, "tp": pos.tp_price}
+        _save_armed_stops(self._armed)
         res = await self._best_effort_attach(pos, new_sl, pos.tp_price)
         return {"status": res.get("status", "OK"), "action": "sl_to_entry", "sl": new_sl}
 
@@ -120,6 +150,10 @@ class PositionManager:
             return {"status": "NO_POSITION", "symbol": symbol}
         res = await self.orders.close_position(pos, 1.0, reason=reason)
         self.positions.pop(pos.instrument.symbol, None)
+        # Drop the persisted bot-side stop: the position is gone, don't re-arm it.
+        if symbol.upper() in self._armed:
+            self._armed.pop(symbol.upper(), None)
+            _save_armed_stops(self._armed)
         return {"status": res.get("status"), "action": "full_close"}
 
     async def modify_stop(self, symbol: str, sl: float | None = None,
@@ -129,9 +163,13 @@ class PositionManager:
             return {"status": "NO_POSITION", "symbol": symbol}
         # Set the bot-side level FIRST so the WS monitor is armed even if the
         # venue attachment fails (exchange tpsl endpoint is unreliable).
-        self.upsert(Position(**{**pos.__dict__,
-                                "sl_price": sl if sl is not None else pos.sl_price,
-                                "tp_price": tp if tp is not None else pos.tp_price}))
+        armed = Position(**{**pos.__dict__,
+                            "sl_price": sl if sl is not None else pos.sl_price,
+                            "tp_price": tp if tp is not None else pos.tp_price})
+        self.upsert(armed)
+        # Persist so a restart re-arms the monitor (no venue stop is possible).
+        self._armed[symbol.upper()] = {"sl": armed.sl_price, "tp": armed.tp_price}
+        _save_armed_stops(self._armed)
         res = await self._best_effort_attach(pos, sl, tp)
         return {"status": res.get("status"), "action": "modify_stop", "sl": sl, "tp": tp}
 

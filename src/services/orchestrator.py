@@ -287,6 +287,17 @@ class Orchestrator:
                 position = Position(**{**position.__dict__, "sl_price": existing.sl_price})
             if position.tp_price is None and existing.tp_price is not None:
                 position = Position(**{**position.__dict__, "tp_price": existing.tp_price})
+        # After a restart the in-memory level is gone but the persisted file has it.
+        # Re-arm the monitor so an open position is never naked (no venue stop exists).
+        if position.sl_price is None and position.tp_price is None:
+            armed = self.positions._armed.get(position.instrument.symbol.upper())
+            if armed:
+                if armed.get("sl") is not None:
+                    position = Position(**{**position.__dict__, "sl_price": armed["sl"]})
+                if armed.get("tp") is not None:
+                    position = Position(**{**position.__dict__, "tp_price": armed["tp"]})
+                log.info("re-armed bot-side SL/TP for %s from persisted state: SL=%s TP=%s",
+                         position.instrument.symbol, position.sl_price, position.tp_price)
         self.positions.upsert(position)
         self._track_position_symbols()
 
