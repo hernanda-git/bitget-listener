@@ -11,41 +11,21 @@ BUG B is closed here: a liquidation is booked at the position's REAL
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-from pathlib import Path
 
 from src.domain.model import Fill, Position, Side
+from bot_common import repos
 
 log = logging.getLogger(__name__)
 
-# Bot-side SL/TP armed levels are not resting on the venue (the exchange tpsl
-# endpoint rejects them for this account), so they live ONLY in memory. Persist
-# them to disk so a process restart re-arms the monitor instead of going naked.
-ARMED_STOPS_PATH = os.getenv("ARMED_STOPS_PATH",
-                              str(Path(os.getenv("STATE_DIR", ".")) / "armed_stops.json"))
+# Bot-side SL/TP armed levels are NOT resting on the venue (the exchange tpsl
+# endpoint rejects them for this account), so they live in the shared DB via
+# bot_common.repos.ArmedStops. That survives a process restart: on_position
+# re-arms the monitor from the DB instead of going naked.
 
 
 class LiquidationPriceUnknown(RuntimeError):
     """Raised rather than silently booking a liquidation at 0.00 (BUG B)."""
-
-
-def _load_armed_stops() -> dict[str, dict]:
-    try:
-        with open(ARMED_STOPS_PATH, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def _save_armed_stops(stops: dict[str, dict]) -> None:
-    try:
-        Path(ARMED_STOPS_PATH).parent.mkdir(parents=True, exist_ok=True)
-        with open(ARMED_STOPS_PATH, "w", encoding="utf-8") as fh:
-            json.dump(stops, fh)
-    except OSError as exc:
-        log.warning("could not persist armed stops to %s: %s", ARMED_STOPS_PATH, exc)
 
 
 class PositionManager:
@@ -56,7 +36,8 @@ class PositionManager:
         self.stream = stream
         self.positions: dict[str, Position] = {}
         # Symbol -> {"sl": float|None, "tp": float|None} persisted across restarts.
-        self._armed: dict[str, dict] = _load_armed_stops()
+        self._armed: dict[str, dict] = repos.ArmedStops.get_all("bitget-listener")
+
 
     # ------------------------------------------------------------------ tracking
     def upsert(self, position: Position) -> None:
@@ -123,7 +104,7 @@ class PositionManager:
         # if the venue attachment fails.
         self.upsert(Position(**{**pos.__dict__, "sl_price": new_sl}))
         self._armed[symbol.upper()] = {"sl": new_sl, "tp": pos.tp_price}
-        _save_armed_stops(self._armed)
+        repos.ArmedStops.set("bitget-listener", symbol, new_sl, pos.tp_price)
         res = await self._best_effort_attach(pos, new_sl, pos.tp_price)
         return {"status": res.get("status", "OK"), "action": "sl_to_entry", "sl": new_sl}
 
@@ -153,7 +134,7 @@ class PositionManager:
         # Drop the persisted bot-side stop: the position is gone, don't re-arm it.
         if symbol.upper() in self._armed:
             self._armed.pop(symbol.upper(), None)
-            _save_armed_stops(self._armed)
+            repos.ArmedStops.remove("bitget-listener", symbol)
         return {"status": res.get("status"), "action": "full_close"}
 
     async def modify_stop(self, symbol: str, sl: float | None = None,
@@ -169,7 +150,7 @@ class PositionManager:
         self.upsert(armed)
         # Persist so a restart re-arms the monitor (no venue stop is possible).
         self._armed[symbol.upper()] = {"sl": armed.sl_price, "tp": armed.tp_price}
-        _save_armed_stops(self._armed)
+        repos.ArmedStops.set("bitget-listener", symbol, armed.sl_price, armed.tp_price)
         res = await self._best_effort_attach(pos, sl, tp)
         return {"status": res.get("status"), "action": "modify_stop", "sl": sl, "tp": tp}
 

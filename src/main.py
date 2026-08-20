@@ -31,6 +31,7 @@ from src.services.risk import RiskLimits
 from src.sources.parser import SymbolMap
 from src.sources.telegram import FakeSignalSource, TelethonSource
 from src.store.ledger import TradeLedger
+from src.store.pg_ledger import PostgresLedger
 from src.streaming.bitget_ws import BitgetWS
 
 log = logging.getLogger("bitget-listener")
@@ -69,7 +70,7 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
         paper=cfg.paper,
         rate_limit=rate_limit,
     )
-    ledger = TradeLedger(os.getenv("LEDGER_PATH", "bitget_listener.db"))
+    ledger = PostgresLedger()
     shadow = ShadowLedger(LedgerEvalStore(ledger),
                           min_trades=int(os.getenv("SHADOW_MIN_TRADES", "30")),
                           auto_downsize=os.getenv("AUTO_DOWNSIZE", "0") == "1")
