@@ -179,11 +179,6 @@ class TelegramNotifier(Notifier):
     def format_liquidation(row) -> str:
         return TelegramNotifier._exit_card("liquidation", row, "💥", "Liquidation")
 
-    async def notify_event(self, text: str) -> None:
-        """Send a realtime push, never raising (alerts must never break trading)."""
-        with contextlib.suppress(Exception):
-            await self.send(text)
-
 
 class CommandRouter:
     """Routes operator commands. State-changing commands require the operator id."""
