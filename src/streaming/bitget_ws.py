@@ -188,7 +188,10 @@ class BitgetWS(MarketStream):
             return
         sub = self.subscribe_frame()
         with contextlib.suppress(Exception):
-            self.rate_limit.acquire("ws")
+            # acquire() is async (it may sleep when rate-limited); fire it on the
+            # running loop without blocking this synchronous callback.
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self.rate_limit.acquire("ws")))
         with contextlib.suppress(Exception):
             self._loop.call_soon_threadsafe(
                 lambda: asyncio.ensure_future(self._ws.send(json.dumps(sub))))

@@ -85,10 +85,16 @@ async def test_duplicate_symbol_position_is_skipped():
 
 @pytest.mark.asyncio
 async def test_daily_loss_limit_halts_new_entries():
+    # The daily-loss denominator is the LIVE wallet equity (FakeExchangeAdapter
+    # reports 1000.0), not the static equity_usd. A 10% cap therefore = 100 USDT.
     fake, orch, *_ = build(paper=False, limits=RiskLimits(max_daily_loss_pct=10,
                                                           equity_usd=100.0))
+    # A loss below the live cap (10% of 1000 = 100) must NOT trip the breaker.
     orch.daily_realized = -25.0
-    assert orch.daily_loss_breached() is True
+    assert await orch.daily_loss_breached() is False
+    # A loss that exceeds the live cap MUST halt new entries.
+    orch.daily_realized = -150.0
+    assert await orch.daily_loss_breached() is True
     await orch.source.start()
     await orch.source.push(LONG, message_id=3)
     await orch.run_once()

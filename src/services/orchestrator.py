@@ -83,7 +83,7 @@ class Orchestrator:
             return f"max concurrent positions ({self.limits.max_concurrent}) reached"
         if rs.symbol_usdt in self.positions.positions:
             return f"already in a {rs.symbol_usdt} position"
-        if self.daily_loss_breached():
+        if await self.daily_loss_breached():
             return "daily loss limit breached"
         if self.tradability is not None:
             t = await self.tradability.check(rs.symbol_usdt)
@@ -91,7 +91,7 @@ class Orchestrator:
                 return f"{rs.symbol_usdt} not tradable: {t.detail}"
         return None
 
-    def daily_loss_breached(self) -> bool:
+    async def daily_loss_breached(self) -> bool:
         """Kill-switch: refuse new entries once realized loss exceeds the cap.
 
         The cap denominator is the LIVE wallet equity, not the static
@@ -105,17 +105,25 @@ class Orchestrator:
         unreadable balance can NEVER make the cap vanish (which would let trading
         continue with no loss guard at all).
         """
-        live_equity = self._live_equity_usd()
+        live_equity = await self._live_equity_usd()
         denom = live_equity if live_equity and live_equity > 0 else self.limits.equity_usd
         denom = max(denom, 1.0)  # never let the cap collapse to ~0
         cap = self.limits.max_daily_loss_pct / 100.0 * denom
         return self.daily_realized <= -abs(cap)
 
-    def _live_equity_usd(self) -> float:
-        """Best-effort live wallet equity for the daily-loss denominator."""
+    async def _live_equity_usd(self) -> float:
+        """Best-effort live wallet equity for the daily-loss denominator.
+
+        In PAPER mode we must NEVER call a signed endpoint (the account endpoint
+        is authenticated). Paper trading has no real equity to read, so we return
+        0.0 and let ``daily_loss_breached`` fall back to the configured
+        ``equity_usd`` — which is exactly the denominator paper mode wants.
+        """
+        if getattr(self, "gate", None) is not None and getattr(self.gate, "paper", False):
+            return 0.0
         try:
             if self.adapter is not None:
-                return float(self.adapter.get_balance_usdt())
+                return float(await self.adapter.get_balance_usdt())
         except Exception as exc:  # noqa: BLE001 - never block the guard on a read failure
             log.warning("live equity read failed (%s) — using configured equity_usd", exc)
         return 0.0
@@ -154,6 +162,13 @@ class Orchestrator:
         signal = self.to_signal(rs)
         if signal is None:
             return {"status": "SKIPPED", "reason": "unparseable signal"}
+
+        # Realtime push: a valid signal was accepted and is about to be traded.
+        # (Rejections already push "REJECTED <SYM>: <reason>" in _after_open.)
+        if self.notifier is not None:
+            with contextlib.suppress(Exception):
+                await self.notifier.send(
+                    TelegramNotifier.format_signal(signal))
 
         self._sync_paper_flag()
         multiplier = self.shadow.size_multiplier(signal.instrument.symbol)
@@ -225,7 +240,7 @@ class Orchestrator:
         self._track_position_symbols()
         if self.notifier is not None:
             with contextlib.suppress(Exception):
-                await self.notifier.send(TelegramNotifier.format_entry(result))
+                await self.notifier.send(TelegramNotifier.format_open(result))
 
     def _local_position(self, order) -> None:
         self.positions.upsert(Position(
@@ -302,7 +317,7 @@ class Orchestrator:
         row = self.ledger.record_close(
             tid, exit_price=mark, close_fee=self.sizer.estimate_close_fee(
                 self.ledger.get(tid)["qty"], mark, None),
-            exit_reason=res.get("action", "close"))
+            exit_reason=res.get("reason") or res.get("action", "close"))
         self.daily_realized += (row.net_usd or 0.0)
         self.shadow.record(symbol, (row.net_usd or 0.0) > 0, row.net_usd or 0.0)
         self.open_trade_ids.pop(symbol, None)
@@ -310,7 +325,19 @@ class Orchestrator:
         if self.notifier is not None:
             from src.notifier.telegram import TelegramNotifier
             with contextlib.suppress(Exception):
-                await self.notifier.send(TelegramNotifier.format_exit(row))
+                reason = row.exit_reason or res.get("reason") or ""
+                # Distinct realtime push per exit type so the operator sees
+                # TP hit / SL hit / manual close / liquidation as separate events.
+                if reason == "target_hit":
+                    await self.notifier.send(TelegramNotifier.format_tp_hit(row))
+                elif reason == "stop_breached":
+                    await self.notifier.send(TelegramNotifier.format_sl_hit(row))
+                elif reason == "liquidation":
+                    await self.notifier.send(TelegramNotifier.format_liquidation(row))
+                elif reason in ("telegram", "manual"):
+                    await self.notifier.send(TelegramNotifier.format_manual_tp(row))
+                else:
+                    await self.notifier.send(TelegramNotifier.format_exit(row))
 
     # --------------------------------------------------------------- stream hooks
     async def on_fill(self, fill) -> None:

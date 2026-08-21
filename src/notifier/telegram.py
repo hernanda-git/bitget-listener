@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import asyncio
 import contextlib
 
 import httpx
@@ -103,6 +104,85 @@ class TelegramNotifier(Notifier):
         return (f"CLOSED {getattr(row, 'symbol', '?')} @ {getattr(row, 'exit_price', '?')}\n"
                 f"net={net:+.4f} USDT (fees {fees:.4f} included)"
                 if net is not None else f"CLOSED {getattr(row, 'symbol', '?')}")
+
+    # ----------------------------------------------------------------- event push
+    # Realtime alerts for the five lifecycle moments the operator asked for:
+    # signal triggered, position opened, TP hit, manual TP triggered, SL hit
+    # (plus liquidation as a safety-case of SL). Each is a distinct, scannable card.
+    @staticmethod
+    def format_signal(signal) -> str:
+        side = getattr(signal, "side", None)
+        side_v = side.value if side is not None else "?"
+        sym = getattr(getattr(signal, "instrument", None), "symbol", "?")
+        glyph = "▲" if str(side_v).upper() in ("BUY", "LONG") else "▼"
+        rows = [
+            f"{glyph} <b>{sym}</b>  {side_v}  · signal received",
+            fmt.plain_row("Entry", fmt.price(getattr(signal, "entry", None))),
+            fmt.plain_row("Stop", fmt.price(getattr(signal, "sl", None))),
+        ]
+        tp = getattr(signal, "tp", None)
+        if tp is not None:
+            rows.append(fmt.plain_row("Target", fmt.price(tp)))
+        notional = getattr(signal, "notional_usd", None)
+        if notional:
+            rows.append(fmt.plain_row("Plan size", f"${notional:.2f}"))
+        return fmt.join(fmt.title("Signal triggered", "📡"), fmt.lines(*rows))
+
+    @staticmethod
+    def format_open(result: dict) -> str:
+        order = result.get("order")
+        if order is None:
+            return ""
+        side_v = getattr(order.side, "value", "?")
+        glyph = "▲" if str(side_v).upper() in ("BUY", "LONG") else "▼"
+        mode = "PAPER" if result.get("status") == "PAPER" else "LIVE"
+        rows = [
+            f"{glyph} <b>{order.instrument.symbol}</b>  {side_v}  · position opened ({mode})",
+            fmt.plain_row("Entry", fmt.price(order.price)),
+            fmt.plain_row("Size", fmt.qty(order.qty)),
+            fmt.plain_row("Stop", fmt.price(order.sl)),
+        ]
+        if order.tp is not None:
+            rows.append(fmt.plain_row("Target", fmt.price(order.tp)))
+        if order.leverage:
+            rows.append(fmt.plain_row("Leverage", f"{order.leverage}x"))
+        return fmt.join(fmt.title("Position opened", "🟢"), fmt.lines(*rows))
+
+    @classmethod
+    def _exit_card(cls, reason: str, row, glyph: str, head: str) -> str:
+        sym = getattr(row, "symbol", "?")
+        net = getattr(row, "net_usd", None)
+        ex = getattr(row, "exit_price", None)
+        er = getattr(row, "exit_reason", "") or reason
+        rows = [f"{glyph} <b>{sym}</b>  · {head}"]
+        rows.append(fmt.plain_row("Exit", fmt.price(ex)))
+        rows.append(fmt.plain_row("Net", fmt.money(net, 4) + " USDT"))
+        if er and er != "full_close":
+            rows.append(fmt.plain_row("Reason", er))
+        fees = getattr(row, "open_fee", 0.0) + getattr(row, "close_fee", 0.0)
+        rows.append(fmt.plain_row("Fees", fmt.money(fees, 4, signed=False) + " USDT"))
+        return fmt.join(fmt.title(head, glyph), fmt.lines(*rows))
+
+    @staticmethod
+    def format_tp_hit(row) -> str:
+        return TelegramNotifier._exit_card("target_hit", row, "🎯", "TP hit")
+
+    @staticmethod
+    def format_sl_hit(row) -> str:
+        return TelegramNotifier._exit_card("stop_breached", row, "🛑", "SL hit")
+
+    @staticmethod
+    def format_manual_tp(row) -> str:
+        return TelegramNotifier._exit_card("manual", row, "✋", "Manual close")
+
+    @staticmethod
+    def format_liquidation(row) -> str:
+        return TelegramNotifier._exit_card("liquidation", row, "💥", "Liquidation")
+
+    async def notify_event(self, text: str) -> None:
+        """Send a realtime push, never raising (alerts must never break trading)."""
+        with contextlib.suppress(Exception):
+            await self.send(text)
 
 
 class CommandRouter:
@@ -553,7 +633,8 @@ class CommandRouter:
                 breached = getattr(self.orch, "daily_loss_breached", None)
                 if callable(breached):
                     try:
-                        if breached():
+                        res = await breached() if asyncio.iscoroutinefunction(breached) else breached()
+                        if res:
                             rows.append("🛑 <b>Daily loss cap reached</b> "
                                         "— new entries halted")
                     except Exception:
