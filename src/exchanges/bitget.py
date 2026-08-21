@@ -283,13 +283,22 @@ class BitgetAdapter(ExchangeAdapter):
         return round(rounded, 12)
 
     @classmethod
-    def round_qty(cls, spec: InstrumentSpec, qty: float, price_ref: float | None = None) -> float:
-        """Step qty to the size multiplier, satisfy min qty and min notional."""
+    def round_qty(cls, spec: InstrumentSpec, qty: float, price_ref: float | None = None,
+                  reduce_only: bool = False) -> float:
+        """Step qty to the size multiplier and satisfy min qty.
+
+        The min-notional inflation loop is INTENTIONALLY SKIPPED for reduce-only
+        (close/partial) orders: a close qty is derived from the position size
+        itself, so bumping it to satisfy Bitget's $min_notional would sell more
+        than is held and trip ``40804`` ("number of closed positions cannot
+        exceed the number held"). Min-notional only matters when *opening* a new
+        position.
+        """
         step = max(spec.qty_step, spec.size_multiplier)
         q = cls._floor_step(qty, step)
         if q < spec.min_qty:
             q = spec.min_qty
-        if price_ref and price_ref > 0:
+        if not reduce_only and price_ref and price_ref > 0:
             guard = 0
             while q * price_ref < spec.min_notional and guard < 10_000_000:
                 q = round(q + step, 12)
@@ -316,7 +325,8 @@ class BitgetAdapter(ExchangeAdapter):
             "productType": self.product_type,
             "marginMode": order.margin_mode,
             "marginCoin": self.margin_coin,
-            "size": str(self.round_qty(spec, order.qty, order.price)),
+            "size": str(self.round_qty(spec, order.qty, order.price,
+                                      reduce_only=order.reduce_only)),
             "side": "buy" if order.side is Side.BUY else "sell",
             "orderType": order.order_type,
             "clientOid": order.client_order_id or self.new_client_oid(),
@@ -370,22 +380,44 @@ class BitgetAdapter(ExchangeAdapter):
         trigger = order.trigger_price if order.trigger_price is not None else order.price
         if trigger is None:
             raise ValueError("protective order requires trigger_price or price")
-        body = {
-            "symbol": self.venue_symbol(order.instrument.symbol),
-            "productType": self.product_type,
-            "marginMode": order.margin_mode,
-            "marginCoin": self.margin_coin,
-            "planType": plan_type,                       # loss_plan | profit_plan
-            "triggerPrice": str(self.round_price(spec, trigger)),
-            "triggerType": "mark_price",
-            "holdSide": "long" if order.side is Side.SELL else "short",
-            "size": str(self.round_qty(spec, order.qty, trigger)),
-            "clientOid": order.client_order_id or self.new_client_oid("bgp"),
-        }
+        body = self._build_tpsl_body(spec, order.instrument.symbol, plan_type, trigger,
+                                     "buy" if order.side is Side.SELL else "sell",
+                                     order.margin_mode, str(self.round_qty(spec, order.qty, trigger)),
+                                     order.client_order_id)
         if self.paper:
             return f"paper-{body['clientOid']}"
         data = await self._signed("POST", P_TPSL, body=body)
         return str(data.get("orderId") or data.get("clientOid"))
+
+    def _build_tpsl_body(self, spec, symbol: str, plan_type: str, trigger: float,
+                         hold_side: str, margin_mode: str, size: str,
+                         client_order_id: str | None) -> dict:
+        """Build the place-tpsl-order body.
+
+        Extracted so the field set can be unit-tested WITHOUT a network round-trip.
+        All of these fields are REQUIRED by Bitget's ``/mix/order/place-tpsl-order``:
+        omitting any of ``side``/``tradeSide``/``orderType``/``timeInForce``/``reduceOnly``
+        makes Bitget accept the request (return an orderId) but silently DROP the order
+        so it never rests in orders-pending (BUG #3 silent drop). ``holdSide`` must be
+        ``buy``/``sell`` (the POSITION side), never ``long``/``short`` (BUG #1, 43011).
+        """
+        return {
+            "symbol": self.venue_symbol(symbol),
+            "productType": self.product_type,
+            "marginMode": margin_mode,
+            "marginCoin": self.margin_coin,
+            "planType": plan_type,                       # loss_plan | profit_plan
+            "triggerPrice": str(self.round_price(spec, trigger)),
+            "triggerType": "mark_price",
+            "holdSide": hold_side,
+            "side": hold_side,
+            "tradeSide": "close",
+            "orderType": "market",
+            "timeInForce": "normal",
+            "reduceOnly": "true",
+            "size": size,
+            "clientOid": client_order_id or self.new_client_oid("bgp"),
+        }
 
     async def cancel_order(self, instrument: Instrument, client_order_id: str) -> bool:
         if self.paper:
@@ -635,9 +667,10 @@ class BitgetAdapter(ExchangeAdapter):
             live = next((p for p in await self.get_positions()
                          if p.instrument.symbol == instrument.symbol), None)
             if live is not None:
-                hold_side = hold_side or ("long" if live.side is Side.BUY else "short")
+                # Bitget V2 accepts "buy"/"sell" for the position side (not "long"/"short").
+                hold_side = hold_side or ("buy" if live.side is Side.BUY else "sell")
                 margin_mode = margin_mode or live.margin_mode
-        hold_side = (hold_side or "long").lower()
+        hold_side = hold_side or "buy"
         margin_mode = margin_mode or "crossed"
         for price, plan in ((sl, "loss_plan"), (tp, "profit_plan")):
             if price is None:
@@ -645,12 +678,8 @@ class BitgetAdapter(ExchangeAdapter):
             if self.paper:
                 log.info("PAPER set_trading_stop %s %s @ %s", instrument.symbol, plan, price)
                 continue
-            body = {"symbol": self.venue_symbol(instrument.symbol), "productType": self.product_type,
-                    "marginMode": margin_mode, "marginCoin": self.margin_coin,
-                    "holdSide": hold_side,
-                    "planType": plan, "triggerPrice": str(self.round_price(spec, price)),
-                    "triggerType": "mark_price",
-                    "clientOid": self.new_client_oid("bgp")}
-            if size:
-                body["size"] = str(self.round_qty(spec, size, price))
+            qty = str(self.round_qty(spec, size, price)) if size else "0"
+            body = self._build_tpsl_body(spec, instrument.symbol, plan, price,
+                                         hold_side, margin_mode, qty,
+                                         self.new_client_oid("bgp"))
             await self._signed("POST", P_TPSL, body=body)

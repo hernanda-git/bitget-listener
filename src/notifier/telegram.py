@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import contextlib
 
 import httpx
 
@@ -412,6 +413,15 @@ class CommandRouter:
 
     async def _read_only(self, cmd: str, args: list[str] | None = None) -> str:
         args = args or []
+        # REAL-TIME FIX: the operator complained the bot reported stale PnL/size.
+        # Every read-only command now reconciles the in-memory cache against the
+        # EXCHANGE first, so /status /positions /pnl reflect the live venue
+        # position (size, mark, PnL) instead of a cache that only updates on a WS
+        # push. Best-effort: if the exchange call fails we still answer with the
+        # last good cache rather than throwing.
+        if self.positions is not None and getattr(self.positions, "adapter", None) is not None:
+            with contextlib.suppress(Exception):
+                await self.positions.sync()
 
         if cmd == "/status":
             st = self.gate.status()

@@ -1,10 +1,19 @@
 """GoLiveGate — the hardened two-step authorization for leaving paper mode.
 
 ``paper`` is the live/dry flag and it is **persisted** (Postgres ``fatty_config``),
-so a restart can never silently resurrect live trading.
+so a restart can never silently resurrect live trading. The authoritative LIVE
+flag the order path reads is ``gate.paper`` (OrderService checks it per order),
+which is seeded from ``PAPER`` env + the persisted ``fatty_config.paper`` row.
 
-Flipping to live requires ALL FOUR conditions from analysis/06 §8 plus a one-time
-token that the operator must echo back:
+IMPORTANT — this gate object is a SECONDARY interlock, not the sole authority:
+``conditions_met`` below gates the ``--go-live`` token *mint/redeem* flow only.
+If the operator sets ``PAPER=0`` (and/or flips ``fatty_config.paper``) directly,
+the bot runs LIVE even while ``conditions_met`` is False. That is by design but is
+a governance gap: the displayed gate can show "conditions not met" while the bot
+trades for real. Treat ``conditions_met`` as an audit signal, not a hard block.
+
+Flipping to live VIA THIS FLOW requires ALL FOUR conditions from analysis/06 §8 plus
+a one-time token that the operator must echo back:
 
   (a) ``bitget_api_probe.py`` GREEN on the real key,
   (b) fee-aware ShadowLedger expectancy > 0,
@@ -13,7 +22,9 @@ token that the operator must echo back:
       liquidation price (BUG B).
 
 The token is single-use, time-limited, and compared with ``secrets.compare_digest``.
-There is no override flag and no "force" path: a missing condition means no go-live.
+A missing condition via this flow means no go-live token — UNLESS ``GO_LIVE_OVERRIDE=1``
+is set in the environment, which bypasses the condition interlock and logs loudly.
+There is intentionally no in-code "force" path other than that operator env flag.
 """
 
 from __future__ import annotations

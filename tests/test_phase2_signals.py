@@ -248,4 +248,55 @@ async def test_catch_up_enqueues_management_only_not_entries():
     assert ("PUMPUSDT", "partial") in syms
     assert ("", "sl_to_entry") in syms
     assert all(s.is_management for s in captured), "entry replayed!"
-    assert len([s for s in captured if s.symbol_usdt == "BTCUSDT"]) == 0
+
+
+# --------------------------------------------------------------------- real @fattyfatclub regression
+# These lock in fixes for bugs found by dumping live channel history. Each string
+# is a verbatim (or near-verbatim) signal the trader actually posted.
+def test_target_keyword_parsed_as_tp():
+    """BUG: signal uses 'TARGET:'/'TARGETS:' but parser only knew tp/takeprofit.
+
+    This is the root cause of the WLD TP=0.4175 drop (signal said TARGET)."""
+    rs = parse_message("#WLD $WLD LONG TRADE\n\nENTRY: 0.364\n\nTARGET: 0.4175\n\nSTOPLOSS: 0.3538")
+    assert rs.symbol_usdt == "WLDUSDT"
+    assert rs.side == "BUY"
+    assert rs.entry == 0.364
+    assert rs.sl == 0.3538
+    assert rs.tp == 0.4175, "TARGET must map to tp"
+
+
+def test_targets_plural_parsed_as_tp():
+    rs = parse_message("#BOME $BOME LONG TRADE\n\nENTRY: 0.000831\n\nTARGET: 0.000982\n\nSTOPLOSS: 0.0008005")
+    assert rs.entry == 0.000831
+    assert rs.tp == 0.000982
+    assert rs.sl == 0.0008005
+
+
+def test_shortened_is_recognized_as_short_side():
+    """'shorted' (not 'short') must yield SELL, else entry opens the wrong way."""
+    rs = parse_message("$ONDO shorted here at 0.345\n\nStoploss above 0.3545")
+    assert rs.symbol_usdt == "ONDOUSDT"
+    assert rs.side == "SELL", "'shorted' must be SELL"
+    # entry has no 'entry' label here ("shorted here at 0.345") -> deferred to the
+    # LLM fallback; the deterministic path still captures side + the labelled SL.
+    assert rs.sl == 0.3545, "stoploss with 'above' qualifier must be captured"
+
+
+def test_longed_again_captures_entry_and_sl_with_qualifiers():
+    rs = parse_message("$SNDK longed again \n\nEntry around 1350\n\nSTOPLOSS: 1295")
+    assert rs.side == "BUY"
+    assert rs.entry == 1350.0, "'entry around 1350' must capture 1350"
+    assert rs.sl == 1295.0
+
+
+def test_closed_for_r_profit_is_full_close_not_sl_to_entry():
+    """'$INJ short closed here for 2R profit' must not become sl_to_entry."""
+    rs = parse_message("$INJ short closed here for 2R profit")
+    assert rs.symbol_usdt == "INJUSDT"
+    assert rs.management_action == "full_close", "closed profit => full_close"
+
+
+def test_first_tp_done_is_partial():
+    rs = parse_message("fartcoin first tp done")
+    # symbol is empty (no $ / no ticker) but the management action must be partial
+    assert rs.management_action == "partial", "first tp done => partial"

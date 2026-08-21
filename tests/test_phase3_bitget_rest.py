@@ -209,6 +209,38 @@ def test_round_qty_never_returns_below_min_qty():
     assert BitgetAdapter.round_qty(spec, 0.0, 60_000.0) >= spec.min_qty
 
 
+# VERIFIED live shape for a sub-$1 coin (WLDUSDT): min_notional 5 USDT, qty step 1,
+# min qty 1. A 2.0-contract position close at ~0.365 price is worth ~0.73 USDT — far
+# below the 5 USDT min_notional. The min-notional inflation loop must be SKIPPED for
+# reduce-only (close) orders, or the close qty balloons to 14 and Bitget rejects it
+# with 40804 "number of closed positions cannot exceed the number held".
+CONTRACT_WLD = {
+    "symbol": "WLDUSDT", "baseCoin": "WLD", "quoteCoin": "USDT",
+    "makerFeeRate": "0.0002", "takerFeeRate": "0.0006",
+    "minTradeNum": "1", "priceEndStep": "1", "volumePlace": "0", "pricePlace": "4",
+    "sizeMultiplier": "1", "symbolType": "perpetual", "minTradeUSDT": "5",
+    "maxLever": "20", "symbolStatus": "normal",
+}
+
+
+def test_round_qty_reduce_only_never_inflates_past_requested_qty():
+    """Regression for 40804: a close (reduce-only) must keep the exact qty."""
+    spec = BitgetAdapter._parse_spec(CONTRACT_WLD)
+    # 2.0 contracts is a valid close qty for a 2.0 position; must NOT balloon to 14.
+    close_qty = BitgetAdapter.round_qty(spec, 2.0, 0.365, reduce_only=True)
+    assert close_qty == 2.0
+    # Even a tiny close must only ever floor to min_qty, never inflate for notional.
+    assert BitgetAdapter.round_qty(spec, 0.5, 0.365, reduce_only=True) == spec.min_qty
+
+
+def test_round_qty_open_still_inflates_to_min_notional():
+    """Entry sizing is unchanged: opening still satisfies the 5 USDT min_notional."""
+    spec = BitgetAdapter._parse_spec(CONTRACT_WLD)
+    open_qty = BitgetAdapter.round_qty(spec, 2.0, 0.365, reduce_only=False)
+    assert open_qty * 0.365 >= spec.min_notional
+    assert open_qty > 2.0  # proves inflation still happens for opens
+
+
 # ------------------------------------------------------------------- order body
 def _adapter(paper=True):
     return BitgetAdapter(KEY, SECRET, PW, product_type="SUSDT-FUTURES", paper=paper)
@@ -251,6 +283,45 @@ def test_order_body_market_uses_ioc():
     spec = BitgetAdapter._parse_spec(CONTRACT_BTC)
     order = OrderRequest(instrument=Instrument.from_token("BTC"), side=Side.BUY, qty=0.01)
     assert ad._order_body(order, spec)["force"] == "ioc"
+
+
+def test_build_tpsl_body_uses_verified_v2_holdSide_not_long_short():
+    """BUG #1: Bitget V2 rejects holdSide 'long'/'short' with 43011.
+
+    The accepted value is the POSITION side: 'buy' for a long (close via SELL
+    order), 'sell' for a short (close via BUY order). Assert the REAL body the
+    adapter posts (no network).
+    """
+    ad = _adapter()
+    spec = BitgetAdapter._parse_spec(CONTRACT_BTC)
+    # Long position: protective closes via SELL order -> holdSide must be 'buy'.
+    long_body = ad._build_tpsl_body(spec, "BTCUSDT", "loss_plan", 54_000.0,
+                                    "buy", "isolated", "0.01", None)
+    assert long_body["holdSide"] == "buy"
+    assert long_body["side"] == "buy"
+    assert long_body["holdSide"] not in ("long", "short")
+    # Short position: holdSide must be 'sell'.
+    short_body = ad._build_tpsl_body(spec, "BTCUSDT", "loss_plan", 70_000.0,
+                                     "sell", "isolated", "0.01", None)
+    assert short_body["holdSide"] == "sell"
+    assert short_body["side"] == "sell"
+
+
+def test_build_tpsl_body_carries_required_persist_fields():
+    """BUG #3: omitting these makes Bitget accept-but-silently-drop the order."""
+    ad = _adapter()
+    spec = BitgetAdapter._parse_spec(CONTRACT_BTC)
+    body = ad._build_tpsl_body(spec, "BTCUSDT", "profit_plan", 70_000.0,
+                               "buy", "isolated", "0.01", None)
+    for required in ("side", "tradeSide", "orderType", "timeInForce", "reduceOnly",
+                     "planType", "triggerPrice", "triggerType", "holdSide", "size"):
+        assert required in body, f"missing required field {required}"
+    assert body["tradeSide"] == "close"
+    assert body["orderType"] == "market"
+    assert body["timeInForce"] == "normal"
+    assert body["reduceOnly"] == "true"
+    assert body["planType"] == "profit_plan"
+    assert body["clientOid"].startswith("bgp-")
 
 
 def test_client_oid_is_unique_and_prefixed():

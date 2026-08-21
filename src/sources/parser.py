@@ -18,8 +18,8 @@ from typing import Iterable, Literal
 
 from src.domain.model import Instrument, RawSignal
 
-_LONG = {"long", "buy", "l", "b"}
-_SHORT = {"short", "sell", "s", "sh"}
+_LONG = {"long", "buy", "l", "b", "longed", "longs"}
+_SHORT = {"short", "sell", "s", "sh", "shorted", "shorting", "shorts"}
 
 # Management action patterns (lowercased). First match wins. Ordered most-specific first.
 # R-dialect: "2R up" / "6R full tp" are trader shorthand — a number followed by "R"
@@ -27,7 +27,8 @@ _SHORT = {"short", "sell", "s", "sh"}
 # "full tp" / "booking tp1" / "tp1 booked" => book partial (tp1).
 _MANAGEMENT = [
     (r"\b(sl to entry|sl be|move sl to be|breakeven|break even)\b", "sl_to_entry"),
-    (r"\b(tp1 booked|tp booked|book partial|partial|partials|booking tp1|tp1)\b", "partial"),
+    (r"\b(tp1 booked|tp booked|book partial|partial|partials|booking tp1|tp1|"
+     r"tp done|tp hit|first tp|booked tp)\b", "partial"),
     (r"\b(close full|exit full|full close|closed at entry|cutting|full|closed)\b", "full_close"),
     (r"\b(cancel|void|invalidated|no longer valid)\b", "cancel_pending"),
     (r"\btp[123]?\s+[\$]?(\d+(?:\.\d+)?)\b", "tp_modify"),
@@ -57,8 +58,8 @@ def _r_dialect_action(clause: str) -> str | None:
     # modify, NOT a partial/close — bail so the numeric handler picks it up.
     if re.search(r"(?:tp[123]?|sl)\s*[:<=>]?\s*[\$]?\s*\d", low):
         return None
-    has_partial = bool(re.search(r"tp1|booking tp|full tp|partial|book", low))
-    has_full = bool(re.search(r"\bfull close\b|\bexit full\b|\bfull\b.*\bclose\b", low))
+    has_partial = bool(re.search(r"tp1|booking tp|full tp|partial|book|tp done|tp hit|first tp", low))
+    has_full = bool(re.search(r"\bfull close\b|\bexit full\b|\bfull\b.*\bclose\b|closed|close here|cut", low))
     if has_full:
         return "full_close"
     if has_partial:
@@ -67,7 +68,8 @@ def _r_dialect_action(clause: str) -> str | None:
 
 _NUM_KEY_RE = re.compile(
     r"(entry|entry price|ep|sl|stoploss|stop loss|tp|takeprofit|take profit|"
-    r"lev|leverage|conf|confidence|size|risk)\s*[:=]?\s*"
+    r"target|targets|lev|leverage|conf|confidence|size|risk)\s*[:=]?\s*"
+    r"(?:around|near|above|below|at|~)?\s*"
     r"[\$]?(-?\d+(?:\.\d+)?)"
 )
 _NUM_KEY_AT_ALL = re.compile(r"(entry|sl|tp|lev|leverage|long|short|buy|sell)", re.IGNORECASE)
@@ -175,6 +177,7 @@ def _extract_num_map(text: str) -> dict[str, float]:
     for key, val in _NUM_KEY_RE.findall(text.lower()):
         k = key.replace(" ", "").replace("entryprice", "entry")
         k = {"ep": "entry", "stoploss": "sl", "takeprofit": "tp",
+             "target": "tp", "targets": "tp",
              "lev": "leverage", "conf": "confidence"}.get(k) or k
         try:
             out[k] = float(val)

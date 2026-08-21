@@ -92,8 +92,33 @@ class Orchestrator:
         return None
 
     def daily_loss_breached(self) -> bool:
-        cap = self.limits.max_daily_loss_pct / 100.0 * self.limits.equity_usd
+        """Kill-switch: refuse new entries once realized loss exceeds the cap.
+
+        The cap denominator is the LIVE wallet equity, not the static
+        ``EQUITY_USD`` env var. Sizing never used EQUITY_USD, so the env was only
+        feeding this denominator — and with the real wallet at ~0.076 USDT versus
+        the configured 8.88, the cap was ~117x too loose (a $2.66 loss budget on
+        a $0.076 account, effectively disabling the breaker).
+
+        Safety: falls back to the configured equity_usd only when the live read
+        fails, and floors the denominator at a small non-zero value so a zero/
+        unreadable balance can NEVER make the cap vanish (which would let trading
+        continue with no loss guard at all).
+        """
+        live_equity = self._live_equity_usd()
+        denom = live_equity if live_equity and live_equity > 0 else self.limits.equity_usd
+        denom = max(denom, 1.0)  # never let the cap collapse to ~0
+        cap = self.limits.max_daily_loss_pct / 100.0 * denom
         return self.daily_realized <= -abs(cap)
+
+    def _live_equity_usd(self) -> float:
+        """Best-effort live wallet equity for the daily-loss denominator."""
+        try:
+            if self.adapter is not None:
+                return float(self.adapter.get_balance_usdt())
+        except Exception as exc:  # noqa: BLE001 - never block the guard on a read failure
+            log.warning("live equity read failed (%s) — using configured equity_usd", exc)
+        return 0.0
 
     # ------------------------------------------------------------------ pipeline
     def to_signal(self, rs: RawSignal) -> Signal | None:
@@ -248,6 +273,22 @@ class Orchestrator:
     async def _book_close(self, symbol: str, res: dict) -> None:
         tid = self.open_trade_ids.get(symbol)
         if tid is None:
+            # DEFENSE-IN-DEPTH: the symbol may not be in the in-memory map (e.g. a
+            # restart cleared it before the ledger rehydrate, or the open predates
+            # the mapping). Fall back to the ledger's open trade for this symbol so
+            # the close is NEVER silently dropped (that was a real defect: a
+            # tp1_booked close executed on the exchange but wrote no ledger row).
+            try:
+                open_rows = [r for r in self.ledger.open_trades()
+                             if r["symbol"] == symbol]
+                if open_rows:
+                    tid = open_rows[0]["id"]
+                    self.open_trade_ids[symbol] = tid
+            except Exception as exc:  # noqa: BLE001
+                log.warning("open-trade lookup failed for %s: %s", symbol, exc)
+        if tid is None:
+            log.error("cannot book close for %s: no open trade in ledger — "
+                      "leaving position as-is (exchange already closed it)", symbol)
             return
         mark = None
         if self.stream is not None:
@@ -368,6 +409,17 @@ class Orchestrator:
                 await self.positions.modify_stop(sym, sl=sl, tp=tp)
 
     async def start(self) -> None:
+        # REHYDRATE open_trade_ids from the ledger so a management close/partial
+        # that arrives after a restart (or when the open happened before the PG
+        # refactor) still books correctly. Without this, _book_close early-returns
+        # on a missing id and the ledger silently skips the close entirely.
+        try:
+            for row in self.ledger.open_trades():
+                self.open_trade_ids[row["symbol"]] = row["id"]
+            if self.open_trade_ids:
+                log.info("rehydrated open_trade_ids from ledger: %s", self.open_trade_ids)
+        except Exception as exc:  # noqa: BLE001 - never block startup on a read failure
+            log.warning("open_trade_ids rehydrate failed (%s) — closes will re-book on open", exc)
         await self.source.start()
         if self.stream is not None:
             self.stream.on_fill = self.on_fill
@@ -387,9 +439,51 @@ class Orchestrator:
         self._task = asyncio.create_task(self._loop())
         self._equity_task = asyncio.create_task(self._equity_sampler())
         self._protection_task = asyncio.create_task(self._protection_sampler())
+        self._reconcile_task = asyncio.create_task(self._position_reconciler())
         # Arm bot-side SL/TP for any open position lacking it (trader's levels
         # from ARM_SL_TP). The WS monitor then closes on breach/target.
         await self._arm_open_protection()
+
+    async def _position_reconciler(self) -> None:
+        """Periodically reconcile the in-memory position cache against the
+        EXCHANGE so /api/state, /bitget_status and /bitget_positions report the
+        real size/PnL instead of a stale cache that only updates on a WS push or
+        an open (BUG: a partial/full close that the WS misses leaves the cache
+        wrong, so the operator sees old PnL). Cheap REST pull; never blocks
+        trading. A failure keeps the last good view rather than nuking state.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(getattr(self, "reconcile_sec", 30))
+                if self.adapter is None:
+                    continue
+                live = await self.adapter.get_positions()
+                # Drop cached positions the exchange no longer has; refresh sizes.
+                live_syms = {p.instrument.symbol for p in (live or []) if p.size > 0}
+                for sym in list(self.positions.positions.keys()):
+                    if sym not in live_syms:
+                        self.positions.positions.pop(sym, None)
+                for p in (live or []):
+                    if p.size > 0:
+                        # Preserve bot-side SL/TP: the exchange has no resting
+                        # stop (this account's tpsl endpoint is unreliable), so
+                        # the monitor-side levels MUST survive the reconcile —
+                        # otherwise a raw upsert wipes SL/TP to None every cycle
+                        # and the position goes naked. Adopt venue levels only
+                        # when actually present, exactly like on_position().
+                        existing = self.positions.get(p.instrument.symbol)
+                        if existing is not None:
+                            if p.sl_price is None and existing.sl_price is not None:
+                                p = Position(**{**p.__dict__,
+                                                "sl_price": existing.sl_price})
+                            if p.tp_price is None and existing.tp_price is not None:
+                                p = Position(**{**p.__dict__,
+                                                "tp_price": existing.tp_price})
+                        self.positions.upsert(p)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - reconciler must never kill the bot
+                log.debug("position reconciler error: %s", exc)
 
     async def _equity_sampler(self) -> None:
         """Periodically append a wallet-equity sample so the dashboard can chart
@@ -456,7 +550,8 @@ class Orchestrator:
     async def stop(self) -> None:
         self._running = False
         for tk in (self._task, getattr(self, "_equity_task", None),
-                   getattr(self, "_protection_task", None)):
+                   getattr(self, "_protection_task", None),
+                   getattr(self, "_reconcile_task", None)):
             if tk:
                 tk.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):

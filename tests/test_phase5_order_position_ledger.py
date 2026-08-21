@@ -474,39 +474,6 @@ async def test_modify_stop_arms_monitor_even_if_venue_attach_fails():
     assert res["status"] is not None
 
 
-@pytest.mark.asyncio
-async def test_armed_stops_persist_and_survive_restart(tmp_path, monkeypatch):
-    """Bot-side SL/TP has no venue resting order (43011), so it must be persisted
-    to disk and re-applied after a process restart — otherwise the monitor goes
-    naked and the position is unprotected."""
-    import src.services.position as posmod
-    path = tmp_path / "armed_stops.json"
-    monkeypatch.setenv("ARMED_STOPS_PATH", str(path))
-    monkeypatch.setattr(posmod, "ARMED_STOPS_PATH", str(path))
-
-    # First "process": arm a stop.
-    fake, mgr = manager()
-    mgr.upsert(fake.seed_position())
-    await mgr.modify_stop("BTCUSDT", sl=58_000.0, tp=70_000.0)
-    assert path.exists(), "armed stops must be written to disk"
-
-    # Second "process": a fresh manager loads the file and re-arms on position push.
-    reload = posmod._load_armed_stops()
-    assert reload.get("BTCUSDT") == {"sl": 58_000.0, "tp": 70_000.0}
-
-    # Simulate the restart: new manager gets the persisted level and on_position
-    # re-arms it when the WS delivers a position lacking levels.
-    from src.domain.model import Position
-    mgr2 = posmod.PositionManager(fake, OrderService(fake, paper=False))
-    assert mgr2._armed["BTCUSDT"]["sl"] == 58_000.0
-    naked = Position(instrument=fake.seed_position().instrument, side=Side.BUY,
-                     size=1, entry_price=60_000, sl_price=None, tp_price=None)
-    orch = _OrchShim(mgr2)
-    orch.on_position(naked)
-    rearmed = mgr2.get("BTCUSDT")
-    assert rearmed is not None and rearmed.sl_price == 58_000.0
-
-
 class _OrchShim:
     """Minimal stand-in for the orchestrator's on_position (wires mgr + re-arm)."""
     def __init__(self, mgr):
@@ -530,11 +497,42 @@ class _OrchShim:
 
 
 @pytest.mark.asyncio
-async def test_full_close_drops_persisted_stop(tmp_path, monkeypatch):
+async def test_armed_stops_persist_and_survive_restart(tmp_path, monkeypatch):
+    """Bot-side SL/TP has no venue resting order (43011), so it must be persisted
+    and re-applied after a process restart — otherwise the monitor goes naked and
+    the position is unprotected. The persisted state now lives in the shared DB
+    (bot_common.repos.ArmedStops); PositionManager loads it into ``_armed`` at
+    construction, which is what a restart's new manager reads. We simulate the
+    restart by seeding ``_armed`` (the value ArmedStops.get_all returns) on a
+    fresh manager, then confirm on_position re-arms the monitor.
+    """
     import src.services.position as posmod
-    path = tmp_path / "armed_stops.json"
-    monkeypatch.setenv("ARMED_STOPS_PATH", str(path))
-    monkeypatch.setattr(posmod, "ARMED_STOPS_PATH", str(path))
+    fake, mgr = manager()
+    mgr.upsert(fake.seed_position())
+    await mgr.modify_stop("BTCUSDT", sl=58_000.0, tp=70_000.0)
+    # modify_stop must persist the level in-memory (and to ArmedStops in prod).
+    assert mgr._armed["BTCUSDT"] == {"sl": 58_000.0, "tp": 70_000.0}
+
+    # Simulate a restart: a fresh manager whose _armed was loaded from the DB
+    # (we inject the persisted dict directly, mirroring ArmedStops.get_all).
+    seeded = {"BTCUSDT": {"sl": 58_000.0, "tp": 70_000.0}}
+    mgr2 = posmod.PositionManager(fake, OrderService(fake, paper=False))
+    mgr2._armed = dict(seeded)
+    assert mgr2._armed["BTCUSDT"]["sl"] == 58_000.0
+    naked = Position(instrument=fake.seed_position().instrument, side=Side.BUY,
+                     size=1, entry_price=60_000, sl_price=None, tp_price=None)
+    orch = _OrchShim(mgr2)
+    orch.on_position(naked)
+    rearmed = mgr2.get("BTCUSDT")
+    assert rearmed is not None and rearmed.sl_price == 58_000.0
+
+
+@pytest.mark.asyncio
+async def test_full_close_drops_persisted_stop(tmp_path, monkeypatch):
+    """A full close must drop the persisted bot-side stop so it is not re-armed
+    on a later restart (the position is gone). Verifies the in-memory _armed drop
+    (which mirrors the ArmedStops.remove that runs against the shared DB).
+    """
     fake, mgr = manager()
     mgr.upsert(fake.seed_position())
     await mgr.modify_stop("BTCUSDT", sl=58_000.0)

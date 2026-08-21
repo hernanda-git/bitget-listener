@@ -79,7 +79,11 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
                           min_trades=int(os.getenv("SHADOW_MIN_TRADES", "30")),
                           auto_downsize=os.getenv("AUTO_DOWNSIZE", "0") == "1")
     gate = GoLiveGate(conditions=GateConditions(), config_store=store)
-    gate.paper = cfg.paper           # persisted flag wins over anything in code
+    # The authoritative LIVE flag is the persisted PAPER value (env PAPER=0 +
+    # Postgres fatty_config.paper). This is INDEPENDENT of the gate's
+    # conditions_met interlock (see golive.py): a direct PAPER=0 flip runs LIVE
+    # even if conditions_met is False. conditions_met is an audit signal only.
+    gate.paper = cfg.paper
 
     # The static SYMBOL_WHITELIST is no longer the gate: a hand-picked list is
     # exactly what silently dropped the PUMP signal (tradable, just not listed).
@@ -229,10 +233,6 @@ async def cmd_go_live(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    import faulthandler
-    faulthandler.enable()
-    # Auto-dump the Python traceback if startup ever spins (diagnostic).
-    faulthandler.dump_traceback_later(6, exit=True, file=sys.stderr)
     load_env()
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO"),

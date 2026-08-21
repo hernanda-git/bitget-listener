@@ -109,15 +109,20 @@ class PositionManager:
         return {"status": res.get("status", "OK"), "action": "sl_to_entry", "sl": new_sl}
 
     async def book_partial(self, symbol: str, fraction: float = 0.5) -> dict:
-        """``tp1 booked``: close part of the position, keep protection on the rest."""
+        """``tp1 booked``: close part of the position, keep protection on the rest.
+
+        The remainder is computed from the REAL exchange size (reported back by
+        close_position as ``real_size``), not the possibly-stale in-memory size,
+        so the in-memory position stays in sync with the venue after the partial.
+        """
         pos = self.get(symbol)
         if pos is None:
             return {"status": "NO_POSITION", "symbol": symbol}
-        # Snapshot the size BEFORE closing: the adapter mutates position state, so
-        # reading pos.size afterwards would compute the remainder off the reduced size.
-        original_size = pos.size
         res = await self.orders.close_position(pos, fraction, reason="tp1_booked")
-        remaining = original_size * (1 - min(1.0, max(0.0, fraction)))
+        real_size = res.get("real_size")
+        # Prefer the exchange-confirmed size; fall back to the cache snapshot.
+        base = real_size if real_size is not None else pos.size
+        remaining = base * (1 - min(1.0, max(0.0, fraction)))
         if remaining > 0:
             self.upsert(Position(**{**pos.__dict__, "size": remaining}))
         else:

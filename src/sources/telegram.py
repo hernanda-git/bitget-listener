@@ -13,6 +13,7 @@ import os
 from src.domain.model import RawSignal
 from src.interfaces.ports import SignalSource
 from src.sources.parser import SymbolMap, parse_signals
+from src.sources.llm_fallback import SignalLLM, parse_with_fallback
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +65,9 @@ class TelethonSource(SignalSource):
         self.symbol_map = symbol_map
         self.queue: asyncio.Queue = asyncio.Queue()
         self._client = None
+        # LLM fallback is a no-op unless LLM_API_KEY is configured; when enabled it
+        # only ever runs for messages the deterministic parser cannot classify.
+        self.llm = SignalLLM()
 
     def _require_creds(self) -> None:
         missing = [n for n, v in (("TG_API_ID", self.api_id),
@@ -82,9 +86,10 @@ class TelethonSource(SignalSource):
 
         @self._client.on(events.NewMessage(chats=self.channel))
         async def _handler(event):    # pragma: no cover - requires a live session
-            for rs in parse_signals(event.raw_text, message_id=event.id,
+            for rs in await parse_with_fallback(event.raw_text, message_id=event.id,
                                     ts_ms=int(event.date.timestamp() * 1000),
-                                    channel=self.channel, symbol_map=self.symbol_map):
+                                    channel=self.channel, symbol_map=self.symbol_map,
+                                    llm=self.llm):
                 rs.has_media = bool(event.media)
                 await self.queue.put(rs)
 
@@ -116,9 +121,10 @@ class TelethonSource(SignalSource):
                 text = msg.message or (msg.text or "")
                 if not text.strip():
                     continue
-                for rs in parse_signals(text, message_id=msg.id,
+                for rs in await parse_with_fallback(text, message_id=msg.id,
                                         ts_ms=int(msg.date.timestamp() * 1000) if msg.date else None,
-                                        channel=self.channel, symbol_map=self.symbol_map):
+                                        channel=self.channel, symbol_map=self.symbol_map,
+                                        llm=self.llm):
                     # Catch-up exists to recover MISSED MANAGEMENT calls (sl/close/tp)
                     # posted while the bot was down. Replaying old ENTRY signals would
                     # open stale positions, so only management is processed here.

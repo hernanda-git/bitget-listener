@@ -123,20 +123,42 @@ class OrderService:
 
     async def close_position(self, position: Position, fraction: float = 1.0,
                              reason: str = "") -> dict:
-        """Close all or part of a position with a reduce-only market order."""
-        spec = await self._spec(position.instrument)
+        """Close all or part of a position with a reduce-only market order.
+
+        ROBUSTNESS FIX: never trust ``position.size`` blindly. The in-memory
+        size can drift from the exchange (e.g. a partial that the WS missed, or a
+        stale cache). ``fraction`` is relative to the REAL venue size: we sync a
+        fresh position first and recompute the close qty from it, then clamp to
+        the actual open size so we can never over-close (selling more than exists)
+        or under-close. The remainder the caller tracks is also based on the real
+        size, not the possibly-stale cache value.
+        """
+        # Reconcile the position against the live exchange before sizing.
+        real_pos = position
+        if not self.paper and self.adapter is not None:
+            try:
+                live = await self.adapter.get_positions()
+                for p in live or []:
+                    if p.instrument.symbol == position.instrument.symbol and p.size > 0:
+                        real_pos = p
+                        break
+            except Exception as exc:  # noqa: BLE001 - never block a close on a read failure
+                log.warning("size-sync failed before close (%s) — using cached size", exc)
+        real_size = real_pos.size
+        spec = await self._spec(real_pos.instrument)
         frac = min(1.0, max(0.0, fraction))
-        qty = position.size * frac
+        qty = real_size * frac
         if qty <= 0:
             return {"status": "NOOP", "reason": "zero close size"}
         order = OrderRequest(
-            instrument=position.instrument, side=position.side.opposite,
-            order_type="market", qty=BitgetAdapter.round_qty(spec, qty, position.entry_price),
-            reduce_only=True, leverage=position.leverage,
-            margin_mode=position.margin_mode,
+            instrument=real_pos.instrument, side=real_pos.side.opposite,
+            order_type="market", qty=BitgetAdapter.round_qty(spec, qty, real_pos.entry_price),
+            reduce_only=True, leverage=real_pos.leverage,
+            margin_mode=real_pos.margin_mode,
             client_order_id=BitgetAdapter.new_client_oid("bgc"),
         )
         if self.paper:
             return {"status": "PAPER", "order": order, "reason": reason}
         order_id = await self.adapter.place_order(order)
-        return {"status": "PLACED", "order_id": order_id, "order": order, "reason": reason}
+        return {"status": "PLACED", "order_id": order_id, "order": order,
+                "reason": reason, "closed_qty": qty, "real_size": real_size}
