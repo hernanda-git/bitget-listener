@@ -212,9 +212,25 @@ class TelegramNotifier(Notifier):
         return fmt.join(fmt.title("Target updated", "🎯"), fmt.lines(*rows))
 
     @staticmethod
-    def format_skipped(symbol: str, reason: str) -> str:
-        rows = [f"⏭ <b>{symbol or 'signal'}</b>  · not traded",
+    def format_skipped(reason: str, rs=None, symbol: str | None = None) -> str:
+        sym = symbol or (getattr(rs, "symbol_usdt", "") or "")
+        raw = (getattr(rs, "raw_text", "") or "").strip()
+        side = getattr(rs, "side", "") or ""
+        action = getattr(rs, "management_action", None) or ""
+        mid = getattr(rs, "message_id", None)
+        rows = [f"⏭ <b>{sym or 'signal'}</b>  · not traded",
                 fmt.plain_row("Reason", reason)]
+        if action:
+            rows.append(fmt.plain_row("Type", f"management · {action}"))
+        elif side:
+            rows.append(fmt.plain_row("Side", side))
+        if mid is not None:
+            rows.append(fmt.plain_row("Msg ID", str(mid)))
+        if raw:
+            shown = raw if len(raw) <= 400 else raw[:397] + "…"
+            rows.append(fmt.plain_row("Raw", f"<code>{shown}</code>"))
+        else:
+            rows.append(fmt.plain_row("Raw", "— (empty)"))
         return fmt.join(fmt.title("Signal skipped", "⏭"), fmt.lines(*rows))
 
     @staticmethod

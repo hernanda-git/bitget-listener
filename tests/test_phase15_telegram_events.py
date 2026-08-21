@@ -98,8 +98,12 @@ def test_tp_modify_card():
 
 
 def test_skipped_card():
-    txt = TelegramNotifier.format_skipped("WLDUSDT", "max concurrent positions (5) reached")
-    assert "Signal skipped" in txt and "WLDUSDT" in txt and "max concurrent" in txt
+    rs = type("RS", (), {"symbol_usdt": "", "raw_text": "$BONK buy but no entry price here",
+                         "side": "BUY", "management_action": None,
+                         "message_id": 9921})()
+    txt = TelegramNotifier.format_skipped("no symbol parsed", rs=rs)
+    assert "Signal skipped" in txt and "no symbol parsed" in txt
+    assert "$BONK buy but no entry" in txt and "9921" in txt
 
 
 def test_mode_change_card():

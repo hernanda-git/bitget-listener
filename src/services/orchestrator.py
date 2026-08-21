@@ -165,12 +165,18 @@ class Orchestrator:
             if self.notifier is not None:
                 with contextlib.suppress(Exception):
                     await self.notifier.send(
-                        TelegramNotifier.format_skipped(rs.symbol_usdt, reason))
+                        TelegramNotifier.format_skipped(reason, rs=rs))
             return {"status": "SKIPPED", "reason": reason}
 
         signal = self.to_signal(rs)
         if signal is None:
-            return {"status": "SKIPPED", "reason": "unparseable signal"}
+            reason = "unparseable signal"
+            self.skipped.append({"symbol": rs.symbol_usdt, "reason": reason})
+            if self.notifier is not None:
+                with contextlib.suppress(Exception):
+                    await self.notifier.send(
+                        TelegramNotifier.format_skipped(reason, rs=rs))
+            return {"status": "SKIPPED", "reason": reason}
 
         # Realtime push: a valid signal was accepted and is about to be traded.
         # (Rejections already push "REJECTED <SYM>: <reason>" in _after_open.)
