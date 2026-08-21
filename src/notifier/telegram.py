@@ -19,6 +19,7 @@ import logging
 import os
 import asyncio
 import contextlib
+from datetime import datetime
 
 import httpx
 
@@ -186,30 +187,54 @@ class TelegramNotifier(Notifier):
         ex = getattr(row, "exit_price", None)
         net = getattr(row, "net_usd", None)
         pct = int(round(fraction * 100))
-        rows = [f"🔰 <b>{sym}</b>  · TP1 booked ({pct}%)"]
-        rows.append(fmt.plain_row("Booked at", fmt.price(ex)))
+        rows = [
+            fmt.row("Symbol", sym),
+            fmt.row("Booked at", fmt.price(ex)),
+        ]
         if net is not None:
-            rows.append(fmt.plain_row("Booked PnL", fmt.money(net, 4) + " USDT"))
-        rows.append(fmt.plain_row("Remaining", f"{100 - pct}% still running"))
-        return fmt.join(fmt.title("TP1 booked", "🔰"), fmt.lines(*rows))
+            rows.append(fmt.row("Booked PnL", fmt.money(net, 4) + " USDT"))
+        rows.append(fmt.row("Remaining", f"{100 - pct}% still running"))
+        rows.append(fmt.hint("⏱ " + fmt.when(datetime.now())))
+        return fmt.join(
+            fmt.title("TP1 booked", "🔰"),
+            fmt.rule(),
+            fmt.lines(*rows))
 
     @staticmethod
     def format_breakeven(symbol: str, sl: float | None) -> str:
-        rows = [f"🔒 <b>{symbol}</b>  · stop moved to break-even",
-                fmt.plain_row("New SL", fmt.price(sl))]
-        return fmt.join(fmt.title("Break-even", "🔒"), fmt.lines(*rows))
+        rows = [
+            fmt.row("Symbol", symbol),
+            fmt.row("New SL", fmt.price(sl)),
+            fmt.hint("⏱ " + fmt.when(datetime.now())),
+        ]
+        return fmt.join(
+            fmt.title("Break-even", "🔒"),
+            fmt.rule(),
+            fmt.lines(*rows))
 
     @staticmethod
     def format_stop_modify(symbol: str, sl: float | None) -> str:
-        rows = [f"🛡 <b>{symbol}</b>  · stop-loss updated",
-                fmt.plain_row("New SL", fmt.price(sl))]
-        return fmt.join(fmt.title("Stop updated", "🛡"), fmt.lines(*rows))
+        rows = [
+            fmt.row("Symbol", symbol),
+            fmt.row("New SL", fmt.price(sl)),
+            fmt.hint("⏱ " + fmt.when(datetime.now())),
+        ]
+        return fmt.join(
+            fmt.title("Stop updated", "🛡"),
+            fmt.rule(),
+            fmt.lines(*rows))
 
     @staticmethod
     def format_tp_modify(symbol: str, tp: float | None) -> str:
-        rows = [f"🎯 <b>{symbol}</b>  · take-profit updated",
-                fmt.plain_row("New TP", fmt.price(tp))]
-        return fmt.join(fmt.title("Target updated", "🎯"), fmt.lines(*rows))
+        rows = [
+            fmt.row("Symbol", symbol),
+            fmt.row("New TP", fmt.price(tp)),
+            fmt.hint("⏱ " + fmt.when(datetime.now())),
+        ]
+        return fmt.join(
+            fmt.title("Target updated", "🎯"),
+            fmt.rule(),
+            fmt.lines(*rows))
 
     @staticmethod
     def format_skipped(reason: str, rs=None, symbol: str | None = None) -> str:
@@ -218,42 +243,61 @@ class TelegramNotifier(Notifier):
         side = getattr(rs, "side", "") or ""
         action = getattr(rs, "management_action", None) or ""
         mid = getattr(rs, "message_id", None)
-        rows = [f"⏭ <b>{sym or 'signal'}</b>  · not traded",
-                fmt.plain_row("Reason", reason)]
         if action:
-            rows.append(fmt.plain_row("Type", f"management · {action}"))
+            kind = f"management · {action}"
         elif side:
-            rows.append(fmt.plain_row("Side", side))
-        if mid is not None:
-            rows.append(fmt.plain_row("Msg ID", str(mid)))
-        if raw:
-            shown = raw if len(raw) <= 400 else raw[:397] + "…"
-            rows.append(fmt.plain_row("Raw", f"<code>{shown}</code>"))
+            kind = f"entry · {side}"
         else:
-            rows.append(fmt.plain_row("Raw", "— (empty)"))
-        return fmt.join(fmt.title("Signal skipped", "⏭"), fmt.lines(*rows))
+            kind = "entry · —"
+        rows = [
+            fmt.row("Symbol", sym or "—"),
+            fmt.row("Type", kind),
+            fmt.row("Reason", reason),
+        ]
+        if mid is not None:
+            rows.append(fmt.row("Message", str(mid)))
+        rows.append(fmt.row("Raw", raw or "—"))
+        rows.append(fmt.hint("⏱ " + fmt.when(datetime.now())))
+        return fmt.join(
+            fmt.title("Signal skipped", "⏭"),
+            fmt.rule(),
+            fmt.lines(*rows))
 
     @staticmethod
     def format_mode_change(mode: str, detail: str = "") -> str:
         glyph = "🧪" if str(mode).upper() == "PAPER" else "🟢"
-        rows = [f"mode is now <b>{mode}</b>"]
+        rows = [fmt.row("Mode", str(mode).upper())]
         if detail:
-            rows.append(fmt.plain_row("Note", detail))
-        return fmt.join(fmt.title("Mode change", glyph), fmt.lines(*rows))
+            rows.append(fmt.row("Note", detail))
+        rows.append(fmt.hint("⏱ " + fmt.when(datetime.now())))
+        return fmt.join(
+            fmt.title("Mode change", glyph),
+            fmt.rule(),
+            fmt.lines(*rows))
 
     @staticmethod
     def format_rate_limit_parked(remaining_s: float) -> str:
+        rows = [
+            fmt.row("State", "new entries parked to avoid IP ban"),
+            fmt.row("Recheck", f"{remaining_s:.0f}s"),
+            fmt.hint("⏱ " + fmt.when(datetime.now())),
+        ]
         return fmt.join(
             fmt.title("Rate-limit park", "⏸"),
-            fmt.plain_row("State", "new entries parked to avoid IP ban"),
-            fmt.plain_row("Recheck", f"{remaining_s:.0f}s"))
+            fmt.rule(),
+            fmt.lines(*rows))
 
     @staticmethod
     def format_catchup(symbol: str, action: str) -> str:
+        rows = [
+            fmt.row("Symbol", symbol),
+            fmt.row("Action", action),
+            fmt.hint("⏱ " + fmt.when(datetime.now())),
+        ]
         return fmt.join(
             fmt.title("Catch-up", "🔄"),
-            fmt.plain_row("Symbol", f"<b>{symbol}</b>"),
-            fmt.plain_row("Action", action))
+            fmt.rule(),
+            fmt.lines(*rows))
 
 
 class CommandRouter:
