@@ -70,3 +70,48 @@ def test_liquidation_card():
 
 def test_open_card_none_order_is_empty():
     assert TelegramNotifier.format_open({"status": "PAPER"}) == ""
+
+
+def _closed_row_full(reason, net):
+    return type("R", (), {"symbol": "WLDUSDT", "exit_price": 0.39, "net_usd": net,
+                          "open_fee": 0.001, "close_fee": 0.001, "exit_reason": reason})()
+
+
+def test_partial_card():
+    txt = TelegramNotifier.format_partial(_closed_row_full("tp1_booked", 0.025), 0.5)
+    assert "TP1 booked" in txt and "50%" in txt and "0.025" in txt
+
+
+def test_breakeven_card():
+    txt = TelegramNotifier.format_breakeven("WLDUSDT", 0.365)
+    assert "Break-even" in txt and "WLDUSDT" in txt and "0.365" in txt
+
+
+def test_stop_modify_card():
+    txt = TelegramNotifier.format_stop_modify("WLDUSDT", 0.34)
+    assert "Stop updated" in txt and "0.34" in txt
+
+
+def test_tp_modify_card():
+    txt = TelegramNotifier.format_tp_modify("WLDUSDT", 0.42)
+    assert "Target updated" in txt and "0.42" in txt
+
+
+def test_skipped_card():
+    txt = TelegramNotifier.format_skipped("WLDUSDT", "max concurrent positions (5) reached")
+    assert "Signal skipped" in txt and "WLDUSDT" in txt and "max concurrent" in txt
+
+
+def test_mode_change_card():
+    txt = TelegramNotifier.format_mode_change("LIVE", "token redeemed")
+    assert "Mode change" in txt and "LIVE" in txt
+
+
+def test_rate_limit_parked_card():
+    txt = TelegramNotifier.format_rate_limit_parked(42.0)
+    assert "Rate-limit park" in txt and "42" in txt
+
+
+def test_catchup_card():
+    txt = TelegramNotifier.format_catchup("WLDUSDT", "pending orders cancelled")
+    assert "Catch-up" in txt and "WLDUSDT" in txt

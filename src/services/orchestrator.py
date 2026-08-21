@@ -151,12 +151,21 @@ class Orchestrator:
                       f"({self.rate_limit.cooldown_remaining_s:.0f}s remaining)")
             self.skipped.append({"symbol": rs.symbol_usdt, "reason": reason})
             log.warning("skipping signal: %s", reason)
+            if self.notifier is not None:
+                with contextlib.suppress(Exception):
+                    await self.notifier.send(
+                        TelegramNotifier.format_rate_limit_parked(
+                            self.rate_limit.cooldown_remaining_s))
             return {"status": "SKIPPED", "reason": reason}
 
         reason = await self.guard(rs)
         if reason is not None:
             self.skipped.append({"symbol": rs.symbol_usdt, "reason": reason})
             log.info("skipping signal: %s", reason)
+            if self.notifier is not None:
+                with contextlib.suppress(Exception):
+                    await self.notifier.send(
+                        TelegramNotifier.format_skipped(rs.symbol_usdt, reason))
             return {"status": "SKIPPED", "reason": reason}
 
         signal = self.to_signal(rs)
@@ -260,16 +269,31 @@ class Orchestrator:
         price = (rs.raw or {}).get("mgmt_price")
         if action == "sl_to_entry":
             res = await self.positions.sl_to_entry(symbol)
+            if self.notifier is not None and res.get("status") not in ("NO_POSITION", "REJECTED"):
+                with contextlib.suppress(Exception):
+                    await self.notifier.send(
+                        TelegramNotifier.format_breakeven(symbol, res.get("sl")))
         elif action == "partial":
             res = await self.positions.book_partial(symbol, 0.5)
         elif action == "full_close":
             res = await self.positions.full_close(symbol)
         elif action == "cancel_pending":
             res = await self.positions.cancel_pending(symbol)
+            if self.notifier is not None and res.get("status") not in ("NO_POSITION", "REJECTED"):
+                with contextlib.suppress(Exception):
+                    await self.notifier.send(TelegramNotifier.format_catchup(symbol, "pending orders cancelled"))
         elif action == "sl_modify":
             res = await self.positions.modify_stop(symbol, sl=price)
+            if self.notifier is not None and res.get("status") not in ("NO_POSITION", "REJECTED"):
+                with contextlib.suppress(Exception):
+                    await self.notifier.send(
+                        TelegramNotifier.format_stop_modify(symbol, res.get("sl")))
         elif action == "tp_modify":
             res = await self.positions.modify_stop(symbol, tp=price)
+            if self.notifier is not None and res.get("status") not in ("NO_POSITION", "REJECTED"):
+                with contextlib.suppress(Exception):
+                    await self.notifier.send(
+                        TelegramNotifier.format_tp_modify(symbol, res.get("tp")))
         else:
             res = {"status": "UNKNOWN_ACTION", "action": action}
         if action in ("full_close", "partial") and res.get("status") not in (
@@ -327,7 +351,8 @@ class Orchestrator:
             with contextlib.suppress(Exception):
                 reason = row.exit_reason or res.get("reason") or ""
                 # Distinct realtime push per exit type so the operator sees
-                # TP hit / SL hit / manual close / liquidation as separate events.
+                # TP hit / SL hit / manual close / liquidation / TP1-booked as
+                # separate events.
                 if reason == "target_hit":
                     await self.notifier.send(TelegramNotifier.format_tp_hit(row))
                 elif reason == "stop_breached":
@@ -336,6 +361,10 @@ class Orchestrator:
                     await self.notifier.send(TelegramNotifier.format_liquidation(row))
                 elif reason in ("telegram", "manual"):
                     await self.notifier.send(TelegramNotifier.format_manual_tp(row))
+                elif reason in ("tp1_booked", "partial"):
+                    frac = float(res.get("closed_fraction") or 0.5)
+                    await self.notifier.send(
+                        TelegramNotifier.format_partial(row, frac))
                 else:
                     await self.notifier.send(TelegramNotifier.format_exit(row))
 

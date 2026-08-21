@@ -179,6 +179,66 @@ class TelegramNotifier(Notifier):
     def format_liquidation(row) -> str:
         return TelegramNotifier._exit_card("liquidation", row, "💥", "Liquidation")
 
+    # ----------------------------------------------------- management / system events
+    @staticmethod
+    def format_partial(row, fraction: float = 0.5) -> str:
+        sym = getattr(row, "symbol", "?")
+        ex = getattr(row, "exit_price", None)
+        net = getattr(row, "net_usd", None)
+        pct = int(round(fraction * 100))
+        rows = [f"🔰 <b>{sym}</b>  · TP1 booked ({pct}%)"]
+        rows.append(fmt.plain_row("Booked at", fmt.price(ex)))
+        if net is not None:
+            rows.append(fmt.plain_row("Booked PnL", fmt.money(net, 4) + " USDT"))
+        rows.append(fmt.plain_row("Remaining", f"{100 - pct}% still running"))
+        return fmt.join(fmt.title("TP1 booked", "🔰"), fmt.lines(*rows))
+
+    @staticmethod
+    def format_breakeven(symbol: str, sl: float | None) -> str:
+        rows = [f"🔒 <b>{symbol}</b>  · stop moved to break-even",
+                fmt.plain_row("New SL", fmt.price(sl))]
+        return fmt.join(fmt.title("Break-even", "🔒"), fmt.lines(*rows))
+
+    @staticmethod
+    def format_stop_modify(symbol: str, sl: float | None) -> str:
+        rows = [f"🛡 <b>{symbol}</b>  · stop-loss updated",
+                fmt.plain_row("New SL", fmt.price(sl))]
+        return fmt.join(fmt.title("Stop updated", "🛡"), fmt.lines(*rows))
+
+    @staticmethod
+    def format_tp_modify(symbol: str, tp: float | None) -> str:
+        rows = [f"🎯 <b>{symbol}</b>  · take-profit updated",
+                fmt.plain_row("New TP", fmt.price(tp))]
+        return fmt.join(fmt.title("Target updated", "🎯"), fmt.lines(*rows))
+
+    @staticmethod
+    def format_skipped(symbol: str, reason: str) -> str:
+        rows = [f"⏭ <b>{symbol or 'signal'}</b>  · not traded",
+                fmt.plain_row("Reason", reason)]
+        return fmt.join(fmt.title("Signal skipped", "⏭"), fmt.lines(*rows))
+
+    @staticmethod
+    def format_mode_change(mode: str, detail: str = "") -> str:
+        glyph = "🧪" if str(mode).upper() == "PAPER" else "🟢"
+        rows = [f"mode is now <b>{mode}</b>"]
+        if detail:
+            rows.append(fmt.plain_row("Note", detail))
+        return fmt.join(fmt.title("Mode change", glyph), fmt.lines(*rows))
+
+    @staticmethod
+    def format_rate_limit_parked(remaining_s: float) -> str:
+        return fmt.join(
+            fmt.title("Rate-limit park", "⏸"),
+            fmt.plain_row("State", "new entries parked to avoid IP ban"),
+            fmt.plain_row("Recheck", f"{remaining_s:.0f}s"))
+
+    @staticmethod
+    def format_catchup(symbol: str, action: str) -> str:
+        return fmt.join(
+            fmt.title("Catch-up", "🔄"),
+            fmt.plain_row("Symbol", f"<b>{symbol}</b>"),
+            fmt.plain_row("Action", action))
+
 
 class CommandRouter:
     """Routes operator commands. State-changing commands require the operator id."""
@@ -220,6 +280,16 @@ class CommandRouter:
         if not self.operator_id:
             return False              # fail closed when unconfigured
         return str(sender_id) == self.operator_id
+
+    def _push_mode(self, detail: str) -> None:
+        """Realtime push when the trading mode changes (toggle/paper/live)."""
+        if self.orch is not None and getattr(self.orch, "notifier", None) is not None:
+            mode = "LIVE" if "LIVE" in detail.upper() else (
+                "PAPER" if "PAPER" in detail.upper() else "")
+            with contextlib.suppress(Exception):
+                asyncio.create_task(
+                    self.orch.notifier.send(
+                        TelegramNotifier.format_mode_change(mode or "?", detail)))
 
     # ------------------------------------------------------------------- helpers
     @property
@@ -278,17 +348,20 @@ class CommandRouter:
                          "Monitoring commands are open — try /bitget_status."))
 
         if action == "toggle":
-            return fmt.join(fmt.title("Mode change", "🔐"),
-                            str(self.gate.toggle("telegram")))
+            out = str(self.gate.toggle("telegram"))
+            self._push_mode(out)
+            return fmt.join(fmt.title("Mode change", "🔐"), out)
         if action == "paper":
-            return fmt.join(fmt.title("Paper mode", "🧪"),
-                            str(self.gate.to_paper("telegram")))
+            out = str(self.gate.to_paper("telegram"))
+            self._push_mode(out)
+            return fmt.join(fmt.title("Paper mode", "🧪"), out)
         if action == "live":
             if not args:
                 return fmt.join(fmt.title("Go live", "🔐"),
                                 fmt.row("Usage", "/bitget_live <token>"),
                                 fmt.hint("Mint a token first, then redeem it here."))
             ok, msg = self.gate.redeem(args[0])
+            self._push_mode("LIVE" if ok else f"live rejected: {msg}")
             return fmt.join(fmt.title("Go live" if ok else "Rejected",
                                       "✅" if ok else "⚠️"), str(msg))
         if action == "close":
