@@ -346,6 +346,50 @@ async def test_book_partial_keeps_the_remainder():
     assert mgr.get("BTCUSDT") is not None
 
 
+# --------------------------------------------------------------------------- BUG A/B regression: PositionManager must NOT require a live Postgres.
+# Commit 3c63035 eagerly opened a shared-DB connection in __init__ (and on every
+# armed-stop write), which broke the zero-network fakes-only suite. The manager
+# must degrade to an in-memory armed-stops mirror when bot_common is absent or the
+# shared store raises.
+def test_position_manager_constructs_without_bot_common(monkeypatch):
+    # Simulate a test/CI environment with no bot_common on the path.
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "bot_common" or name.startswith("bot_common."):
+            raise ImportError("no bot_common in this environment")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    fake = FakeExchangeAdapter()
+    mgr = PositionManager(fake, OrderService(fake, paper=False))
+    assert mgr._armed_store._use_pg is False
+    assert mgr._armed == {}
+
+
+@pytest.mark.asyncio
+async def test_armed_stop_writes_survive_without_pg(monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "bot_common" or name.startswith("bot_common."):
+            raise ImportError("no bot_common in this environment")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    fake, mgr = manager()
+    pos = fake.seed_position(side=Side.BUY, entry=60_000.0)
+    mgr.upsert(pos)
+    res = await mgr.sl_to_entry("BTCUSDT")
+    assert res["sl"] == 60_000.0
+    # in-memory mirror must track the armed level even with no DB
+    assert mgr._armed["BTCUSDT"]["sl"] == 60_000.0
+    await mgr.full_close("BTCUSDT")
+    assert "BTCUSDT" not in mgr._armed  # removal reflected in the mirror
+
+
 @pytest.mark.asyncio
 async def test_book_partial_full_fraction_clears_position():
     fake, mgr = manager()

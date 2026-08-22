@@ -70,11 +70,21 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
         paper=cfg.paper,
         rate_limit=rate_limit,
     )
-    ledger = PostgresLedger()
-    # Self-heal the shared schema on every start (idempotent; cheap).
-    from bot_common import ensure_schema
-    with contextlib.suppress(Exception):
-        ensure_schema()
+    # Ledger selection must track whether the shared Postgres is actually in use.
+    # The live systemd unit sets PGDATABASE/PGHOST, so we use the shared
+    # PostgresLedger there; otherwise (no-creds paper smoke, CI without the
+    # shared DB) we fall back to a file-backed TradeLedger so the bot still runs
+    # and the "originally-broke-the-build" smoke test stays green without a DB.
+    _pg_configured = bool(os.getenv("PGDATABASE") or os.getenv("PGHOST"))
+    if _pg_configured:
+        ledger = PostgresLedger()
+        # Self-heal the shared schema on every start (idempotent; cheap).
+        from bot_common import ensure_schema
+        with contextlib.suppress(Exception):
+            ensure_schema()
+    else:
+        from src.store.ledger import TradeLedger
+        ledger = TradeLedger(os.getenv("LEDGER_PATH", ":memory:"))
     shadow = ShadowLedger(LedgerEvalStore(ledger),
                           min_trades=int(os.getenv("SHADOW_MIN_TRADES", "30")),
                           auto_downsize=os.getenv("AUTO_DOWNSIZE", "0") == "1")

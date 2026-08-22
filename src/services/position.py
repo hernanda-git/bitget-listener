@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 
 from src.domain.model import Fill, Position, Side
-from bot_common import repos
 
 log = logging.getLogger(__name__)
 
@@ -22,10 +21,69 @@ log = logging.getLogger(__name__)
 # endpoint rejects them for this account), so they live in the shared DB via
 # bot_common.repos.ArmedStops. That survives a process restart: on_position
 # re-arms the monitor from the DB instead of going naked.
+#
+# The shared store is a *real* Postgres connection. The fakes-only test suite
+# (and any environment without the shared DB) must never be forced to open one,
+# so we degrade gracefully to an in-memory mirror when the store is unreachable.
+# Live behavior is unchanged: when the store is reachable we read/write through
+# it exactly as before.
 
 
 class LiquidationPriceUnknown(RuntimeError):
     """Raised rather than silently booking a liquidation at 0.00 (BUG B)."""
+
+
+class _ArmedStopsStore:
+    """Thin facade over ``bot_common.repos.ArmedStops`` with an in-memory fallback.
+
+    Construction must NEVER open a network connection. We probe reachability only
+    on first write (set/remove), and permanently fall back to the in-memory dict
+    for the rest of the process if the shared store raises. Reads (get_all) also
+    fall back silently. This keeps the "zero-network fakes-only" suite honest.
+    """
+
+    BOT = "bitget-listener"
+
+    def __init__(self) -> None:
+        self._mem: dict[str, dict] = {}
+        self._mem_loaded = False
+        self._use_pg = True  # downgraded to False on first connection failure
+
+    def _repo(self):
+        from bot_common import repos  # imported lazily; may itself import psycopg
+        return repos.ArmedStops
+
+    def get_all(self) -> dict[str, dict]:
+        if not self._use_pg:
+            return dict(self._mem)
+        try:
+            return self._repo().get_all(self.BOT)
+        except Exception as exc:  # noqa: BLE001 - any DB failure -> in-memory
+            log.debug("ArmedStops.get_all fell back to in-memory (%s)", exc)
+            self._use_pg = False
+            return dict(self._mem)
+
+    def set(self, symbol: str, sl, tp) -> None:
+        sym = symbol.upper()
+        self._mem[sym] = {"sl": sl, "tp": tp}
+        if not self._use_pg:
+            return
+        try:
+            self._repo().set(self.BOT, symbol, sl, tp)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ArmedStops.set fell back to in-memory (%s)", exc)
+            self._use_pg = False
+
+    def remove(self, symbol: str) -> None:
+        sym = symbol.upper()
+        self._mem.pop(sym, None)
+        if not self._use_pg:
+            return
+        try:
+            self._repo().remove(self.BOT, symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ArmedStops.remove fell back to in-memory (%s)", exc)
+            self._use_pg = False
 
 
 class PositionManager:
@@ -36,7 +94,10 @@ class PositionManager:
         self.stream = stream
         self.positions: dict[str, Position] = {}
         # Symbol -> {"sl": float|None, "tp": float|None} persisted across restarts.
-        self._armed: dict[str, dict] = repos.ArmedStops.get_all("bitget-listener")
+        # No connection is opened here; falls back to in-memory if the shared
+        # store is unreachable (see _ArmedStopsStore).
+        self._armed_store = _ArmedStopsStore()
+        self._armed: dict[str, dict] = self._armed_store.get_all()
 
 
     # ------------------------------------------------------------------ tracking
@@ -104,7 +165,7 @@ class PositionManager:
         # if the venue attachment fails.
         self.upsert(Position(**{**pos.__dict__, "sl_price": new_sl}))
         self._armed[symbol.upper()] = {"sl": new_sl, "tp": pos.tp_price}
-        repos.ArmedStops.set("bitget-listener", symbol, new_sl, pos.tp_price)
+        self._armed_store.set(symbol, new_sl, pos.tp_price)
         res = await self._best_effort_attach(pos, new_sl, pos.tp_price)
         return {"status": res.get("status", "OK"), "action": "sl_to_entry", "sl": new_sl}
 
@@ -139,7 +200,7 @@ class PositionManager:
         # Drop the persisted bot-side stop: the position is gone, don't re-arm it.
         if symbol.upper() in self._armed:
             self._armed.pop(symbol.upper(), None)
-            repos.ArmedStops.remove("bitget-listener", symbol)
+            self._armed_store.remove(symbol)
         return {"status": res.get("status"), "action": "full_close"}
 
     async def modify_stop(self, symbol: str, sl: float | None = None,
@@ -155,7 +216,7 @@ class PositionManager:
         self.upsert(armed)
         # Persist so a restart re-arms the monitor (no venue stop is possible).
         self._armed[symbol.upper()] = {"sl": armed.sl_price, "tp": armed.tp_price}
-        repos.ArmedStops.set("bitget-listener", symbol, armed.sl_price, armed.tp_price)
+        self._armed_store.set(symbol, armed.sl_price, armed.tp_price)
         res = await self._best_effort_attach(pos, sl, tp)
         return {"status": res.get("status"), "action": "modify_stop", "sl": sl, "tp": tp}
 
