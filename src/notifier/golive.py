@@ -78,6 +78,23 @@ class GoLiveGate:
     _token: str | None = field(default=None, repr=False)
     _token_ts: float = 0.0
 
+    def __post_init__(self) -> None:
+        # Seed the audit-signal conditions (a)/(c) from the last genuinely-green
+        # probe / test run, if still within TTL. This makes the gate reflect
+        # reality on a live box instead of being permanently red. It is advisory
+        # only: it never flips ``paper`` and never forces a trade path. A missing
+        # or stale status file simply leaves the flags False (fail-safe). The live
+        # LIVE flag remains governed by ``PAPER`` env + persisted fatty_config.paper.
+        try:
+            from src.notifier.golive_status import load
+            status = load()
+            if status.get("probe_green"):
+                self.conditions.probe_green = True
+            if status.get("tests_green"):
+                self.conditions.tests_green = True
+        except Exception as exc:  # noqa: BLE001 - never let status break startup
+            log.debug("go-live status seed skipped: %s", exc)
+
     # ------------------------------------------------------------------- minting
     def mint_token(self) -> tuple[bool, str]:
         """``--go-live`` mints a one-time token, but ONLY if every condition holds.

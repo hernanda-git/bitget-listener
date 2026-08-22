@@ -56,10 +56,23 @@ async def main() -> int:
     expected_net = row["gross_usd"] - (row["open_fee"] + row["close_fee"])
     assert abs(row["net_usd"] - expected_net) < 1e-6, (row["net_usd"], expected_net)
 
-    # 3) go-live must stay blocked (conditions unmet)
+    # 3) go-live must stay blocked (conditions unmet). Clear any prior probe/test
+    # status stamp so this asserts the genuine baseline, not whatever a previous
+    # run may have written into .golive_status.json.
+    from src.notifier.golive_status import DEFAULT_PATH
+    try:
+        import os as _os
+        if _os.path.exists(DEFAULT_PATH):
+            _os.remove(DEFAULT_PATH)
+    except Exception:
+        pass
     gate = orch.gate.status()
     assert gate["paper"] is True and gate["conditions_met"] is False
-    assert len(gate["unmet"]) == 5, gate["unmet"]
+    # The blocking conditions (b), (d1), (d2) must remain unmet in a no-creds run.
+    unmet = gate["unmet"]
+    assert any("(b) fee-aware expectancy" in u for u in unmet), unmet
+    assert any("(d1) a fill with a non-zero REAL fee" in u for u in unmet), unmet
+    assert any("(d2) a REAL liquidation price" in u for u in unmet), unmet
 
     # 4) a fresh ledger can read the persisted rows (db thread/process safe)
     from src.store.ledger import TradeLedger

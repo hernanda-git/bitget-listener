@@ -36,7 +36,7 @@ async def main():
         product_type=os.environ.get("BITGET_PRODUCT_TYPE", "USDT-FUTURES"),
         paper=False,
     )
-    ledger = TradeLedger(os.environ.get("LEDGER_PATH", "bitget_listener.db"))
+    ledger = TradeLedger(os.environ.get("LEDGER_PATH", ":memory:"))
     positions = SimpleNamespace(positions={}, adapter=adapter, stream=None)
 
     # Optional: seed a fake position so the populated layouts can be inspected

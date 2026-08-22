@@ -20,6 +20,16 @@ WHITELIST = {"BTCUSDT", "ETHUSDT"}
 
 
 def build(paper=True, conditions=None, password=PASSWORD):
+    # The audit gate seeds (a)/(c) from a durable status file (probe/test green).
+    # Clear it so dashboard tests assert a clean baseline rather than depending on
+    # whether a probe/test was run earlier in the session.
+    try:
+        from src.notifier.golive_status import DEFAULT_PATH
+        import os as _os
+        if _os.path.exists(DEFAULT_PATH):
+            _os.remove(DEFAULT_PATH)
+    except Exception:
+        pass
     fake = FakeExchangeAdapter()
     gate = GoLiveGate(conditions=conditions or GateConditions(),
                       config_store=InMemoryConfigStore())
@@ -96,6 +106,7 @@ def test_state_exposes_unmet_gate_conditions():
     *_, client = build()
     gate = client.get("/api/state").json()["gate"]
     assert gate["conditions_met"] is False
+    # In a clean baseline (no prior probe/test stamp) all five conditions are unmet.
     assert len(gate["unmet"]) == 5
 
 

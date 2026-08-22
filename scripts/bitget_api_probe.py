@@ -314,6 +314,13 @@ def main() -> int:
         print("PROBE GREEN on the public surface; signed checks SKIPPED (no keys).")
         return 0
     print("PROBE FULLY GREEN.")
+    # Record the green probe so the live bot's audit gate can reflect reality
+    # (see src/notifier/golive_status.py). Advisory only; never blocks or forces.
+    try:
+        from src.notifier.golive_status import stamp
+        stamp("probe_green")
+    except Exception:  # noqa: BLE001 - must not fail the probe on status write
+        pass
     return 0
 
 
