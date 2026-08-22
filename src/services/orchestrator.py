@@ -242,14 +242,22 @@ class Orchestrator:
                                 f"PROTECTION {order.instrument.symbol}: "
                                 f"SL={order.sl} TP={order.tp} ({plan.get('status')})")
                 except Exception as exc:
-                    log.error("attach_protective failed after open (%s) — position is "
-                              "NAKED on the venue but MONITOR-ARMED via bot-side SL/TP", exc)
+                    # HONEST FAILURE: the venue rejected or silently dropped the
+                    # protective order (Bitget's place-tpsl-order accepts but never
+                    # rests it). Do NOT claim "monitor-armed" as if that were safe —
+                    # the bot-side monitor only protects while THIS PROCESS is alive.
+                    # On restart/WS-drop the position is NAKED. Escalate loudly.
+                    log.error("attach_protective FAILED after open (%s) — %s is "
+                              "UNPROTECTED on the venue (bot-side monitor is the ONLY "
+                              "safety net, and it dies with this process)", exc,
+                              order.instrument.symbol)
                     if self.notifier is not None:
                         with contextlib.suppress(Exception):
                             await self.notifier.send(
-                                f"WARNING {order.instrument.symbol} venue stops FAILED "
-                                f"(monitor-side SL/TP armed: SL={order.sl} TP={order.tp}). "
-                                f"Attach error: {exc}")
+                                f"🚨 CRITICAL {order.instrument.symbol} VENUE SL/TP FAILED "
+                                f"to rest (SL={order.sl} TP={order.tp}). Position is "
+                                f"UNPROTECTED on Bitget except the in-process monitor. "
+                                f"Set a stop manually or fix the tpsl endpoint. Err: {exc}")
         # Ensure the WS price feed tracks this position's coin so the SL/TP
         # monitor receives ticks for it (not just the dead-man sentinel).
         self._track_position_symbols()

@@ -661,6 +661,14 @@ class BitgetAdapter(ExchangeAdapter):
         and ``marginMode`` must match the position's actual mode (crossed/isolated)
         or the order is rejected. Both are derived from the live position when not
         supplied, so callers (auto-protect on open, /sl_modify) don't have to pass them.
+
+        CRITICAL (silent-drop hardening): Bitget's ``place-tpsl-order`` endpoint
+        ACCEPTS the request and returns a (fake) ``orderId`` even when it silently
+        drops the order so it never rests in ``orders-pending`` and never sets the
+        position's ``stopLoss``/``takeProfit``. We must VERIFY the protection is
+        actually live on the venue afterwards; if it is not, raise so the caller
+        escalates loudly instead of believing the position is protected. A blind
+        "PLACED" on a phantom order is worse than a visible failure.
         """
         spec = await self.get_spec(instrument)
         if hold_side is None or margin_mode is None:
@@ -683,3 +691,21 @@ class BitgetAdapter(ExchangeAdapter):
                                          hold_side, margin_mode, qty,
                                          self.new_client_oid("bgp"))
             await self._signed("POST", P_TPSL, body=body)
+        # VERIFY the protection actually rests on the venue. Bitget silently drops
+        # the order (returns orderId, rests nothing), so trusting the response is
+        # how positions end up naked while the bot thinks they are protected.
+        if not self.paper:
+            live_sl, live_tp = await self.get_protection(instrument)
+            want_sl = float(sl) if sl is not None else None
+            want_tp = float(tp) if tp is not None else None
+            sl_ok = (want_sl is None) or (live_sl is not None
+                    and abs(live_sl - want_sl) / max(want_sl, 1e-9) < 0.01)
+            tp_ok = (want_tp is None) or (live_tp is not None
+                    and abs(live_tp - want_tp) / max(want_tp, 1e-9) < 0.01)
+            if not (sl_ok and tp_ok):
+                raise BitgetError(
+                    "PROTECTION_NOT_RESTED",
+                    f"set_trading_stop {instrument.symbol}: Bitget accepted but protection "
+                    f"did not rest (wanted sl={want_sl} tp={want_tp}, got sl={live_sl} tp={live_tp}). "
+                    f"Position is NAKED on the venue.",
+                    P_TPSL)

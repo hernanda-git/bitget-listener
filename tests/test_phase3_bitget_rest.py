@@ -599,6 +599,62 @@ async def test_place_order_repairs_once_on_repairable_reject(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_set_trading_stop_raises_when_order_silently_dropped(monkeypatch):
+    """CRITICAL regression: Bitget's place-tpsl-order ACCEPTS but silently drops the
+    order (returns an orderId, rests nothing). set_trading_stop must VERIFY the
+    protection is actually live and raise if not — otherwise positions go naked while
+    the bot believes they are protected."""
+    ad = _adapter(paper=False)
+    ad._spec_cache["BTCUSDT"] = BitgetAdapter._parse_spec(CONTRACT_BTC)
+
+    class _Pos:
+        instrument = Instrument.from_token("BTCUSDT")
+        side = Side.BUY
+        margin_mode = "isolated"
+    async def fake_positions():
+        return [_Pos()]
+    async def fake_get_protection(instrument):
+        # The venue reports NOTHING resting -> the drop was silent.
+        return (None, None)
+    async def fake_signed(method, path, params=None, body=None):
+        return {"orderId": "fake-1"}   # Bitget "accepts" but drops
+
+    monkeypatch.setattr(ad, "get_positions", fake_positions)
+    monkeypatch.setattr(ad, "get_protection", fake_get_protection)
+    monkeypatch.setattr(ad, "_signed", fake_signed)
+    with pytest.raises(BitgetError) as exc:
+        await ad.set_trading_stop(Instrument.from_token("BTCUSDT"), 54_000.0, 70_000.0,
+                                  size=0.01, hold_side="buy", margin_mode="isolated")
+    assert exc.value.code == "PROTECTION_NOT_RESTED"
+
+
+@pytest.mark.asyncio
+async def test_set_trading_stop_ok_when_protection_rests(monkeypatch):
+    """When the venue actually reports the resting SL/TP, set_trading_stop must NOT
+    raise (the silent-drop guard passes)."""
+    ad = _adapter(paper=False)
+    ad._spec_cache["BTCUSDT"] = BitgetAdapter._parse_spec(CONTRACT_BTC)
+
+    class _Pos:
+        instrument = Instrument.from_token("BTCUSDT")
+        side = Side.BUY
+        margin_mode = "isolated"
+    async def fake_positions():
+        return [_Pos()]
+    async def fake_get_protection(instrument):
+        return (54_000.0, 70_000.0)   # confirmed resting
+    async def fake_signed(method, path, params=None, body=None):
+        return {"orderId": "ok-1"}
+
+    monkeypatch.setattr(ad, "get_positions", fake_positions)
+    monkeypatch.setattr(ad, "get_protection", fake_get_protection)
+    monkeypatch.setattr(ad, "_signed", fake_signed)
+    # must not raise
+    await ad.set_trading_stop(Instrument.from_token("BTCUSDT"), 54_000.0, 70_000.0,
+                              size=0.01, hold_side="buy", margin_mode="isolated")
+
+
+@pytest.mark.asyncio
 async def test_place_order_does_not_repair_unrepairable_error(monkeypatch):
     ad = _adapter(paper=False)
     ad._spec_cache["BTCUSDT"] = BitgetAdapter._parse_spec(CONTRACT_BTC)
