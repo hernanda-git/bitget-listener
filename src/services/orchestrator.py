@@ -62,6 +62,7 @@ class Orchestrator:
         self.skipped: list[dict] = []
         self._task: asyncio.Task | None = None
         self._running = False
+        self.report_interval_s = float(os.getenv("BITGET_REPORT_INTERVAL_S", "21600"))
 
     # ------------------------------------------------------------------- guards
     def _sync_paper_flag(self) -> None:
@@ -515,6 +516,8 @@ class Orchestrator:
         self._equity_task = asyncio.create_task(self._equity_sampler())
         self._protection_task = asyncio.create_task(self._protection_sampler())
         self._reconcile_task = asyncio.create_task(self._position_reconciler())
+        if self.report_interval_s > 0 and self.notifier is not None:
+            self._report_task = asyncio.create_task(self._periodic_report())
         # Arm bot-side SL/TP for any open position lacking it (trader's levels
         # from ARM_SL_TP). The WS monitor then closes on breach/target.
         await self._arm_open_protection()
@@ -615,6 +618,44 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001 - sampler must never kill the bot
                 log.exception("equity sampler error: %s", exc)
 
+    async def _periodic_report(self) -> None:
+        """Send a low-frequency, read-only operator report."""
+        while self._running:
+            try:
+                await asyncio.sleep(self.report_interval_s)
+                with contextlib.suppress(Exception):
+                    await self.positions.sync()
+                available = None
+                with contextlib.suppress(Exception):
+                    available = await self.adapter.get_balance_usdt()
+                from src.notifier import bot_poller
+                notifier = self.notifier
+                if notifier is None:
+                    return
+                breaker = bool(self.rate_limit.is_open()) if self.rate_limit else False
+                deadman = bool(self.deadman and not self.deadman.trading_allowed)
+                positions = [f"{p.instrument.symbol} {p.size:g}"
+                             for p in self.positions.positions.values()]
+                state = self.gate.status()
+                await notifier.send(TelegramNotifier.format_report({
+                    "mode": state.get("mode", "?"),
+                    "healthy": not deadman and not breaker and not bot_poller.tg_cmd_degraded(),
+                    "exchange_positions": len(self.positions.positions),
+                    "ledger_open_rows": len(self.ledger.open_trades()),
+                    "available": available,
+                    "net": sum(self.ledger.net_pnls()),
+                    "fees": self.ledger.total_fees(),
+                    "deadman": deadman,
+                    "breaker": breaker,
+                    "tg_degraded": bot_poller.tg_cmd_degraded(),
+                    "positions": positions,
+                    "unmet": state.get("unmet", []),
+                }))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - reporting never kills trading
+                log.warning("periodic report failed: %s", exc)
+
     async def _protection_sampler(self) -> None:
         """BUG #3: periodically refresh the REAL resting SL/TP for open positions
         so /api/state surfaces live plan-order protection.
@@ -669,7 +710,8 @@ class Orchestrator:
         self._running = False
         for tk in (self._task, getattr(self, "_equity_task", None),
                    getattr(self, "_protection_task", None),
-                   getattr(self, "_reconcile_task", None)):
+                   getattr(self, "_reconcile_task", None),
+                   getattr(self, "_report_task", None)):
             if tk:
                 tk.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):

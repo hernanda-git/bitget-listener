@@ -149,6 +149,33 @@ class TelegramNotifier(Notifier):
             rows.append(fmt.plain_row("Leverage", f"{order.leverage}x"))
         return fmt.join(fmt.title("Position opened", "🟢"), fmt.lines(*rows))
 
+    @staticmethod
+    def format_report(data: dict) -> str:
+        """Operator-friendly periodic health/state report."""
+        mode = data.get("mode", "?")
+        healthy = data.get("healthy", False)
+        title = fmt.title("Bitget periodic report", "✅" if healthy else "⚠️")
+        rails = fmt.lines(
+            fmt.plain_row("Mode", f"<b>{mode}</b>"),
+            fmt.plain_row("Exchange positions", str(data.get("exchange_positions", 0))),
+            fmt.plain_row("Ledger open rows", str(data.get("ledger_open_rows", 0))),
+            fmt.plain_row("Available", f"<b>{fmt.money(data.get('available'), 4, signed=False)} USDT</b>"),
+            fmt.plain_row("Lifetime net", f"{fmt.money(data.get('net'), 4)} USDT"),
+            fmt.plain_row("Fees", f"{fmt.money(data.get('fees'), 4, signed=False)} USDT"),
+            fmt.plain_row("Deadman", "halted" if data.get("deadman") else "normal"),
+            fmt.plain_row("Rate limit", "tripped" if data.get("breaker") else "normal"),
+            fmt.plain_row("Telegram commands", "degraded" if data.get("tg_degraded") else "normal"),
+        )
+        blocks = [title, rails]
+        positions = data.get("positions") or []
+        if positions:
+            blocks.append(fmt.lines("📈 <b>Positions</b>",
+                                    fmt.plain_row("Open", ", ".join(positions))))
+        if data.get("unmet"):
+            blocks.append(fmt.lines("🔒 <b>Gate evidence still missing</b>",
+                                    *[f"{fmt.BULLET} {x}" for x in data["unmet"]]))
+        return fmt.join(*blocks)
+
     @classmethod
     def _exit_card(cls, reason: str, row, glyph: str, head: str) -> str:
         sym = getattr(row, "symbol", "?")

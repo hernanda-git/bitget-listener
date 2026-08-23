@@ -119,3 +119,15 @@ def test_rate_limit_parked_card():
 def test_catchup_card():
     txt = TelegramNotifier.format_catchup("WLDUSDT", "pending orders cancelled")
     assert "Catch-up" in txt and "WLDUSDT" in txt
+
+
+def test_periodic_report_has_health_and_ledger_state():
+    txt = TelegramNotifier.format_report({
+        "mode": "LIVE", "healthy": True, "exchange_positions": 0,
+        "ledger_open_rows": 0, "available": 8.4849, "net": -0.3296,
+        "fees": 0.0174, "deadman": False, "breaker": False,
+        "tg_degraded": False, "positions": [], "unmet": ["real fee"],
+    })
+    assert "Bitget periodic report" in txt
+    assert "LIVE" in txt and "8.4849" in txt
+    assert "Ledger open rows" in txt and "real fee" in txt
