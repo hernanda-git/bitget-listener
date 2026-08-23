@@ -75,6 +75,8 @@ class Orchestrator:
             return "dead-man's switch active (feed stale)"
         if not rs.symbol_usdt:
             return "no symbol parsed"
+        if rs.chart and not bool((rs.raw or {}).get("chart_executable")):
+            return "chart has no explicit executable entry and protective SL"
         # Static denylist still short-circuits instantly, but we no longer DROP
         # a tradable symbol just because it wasn't on a hand-picked list.
         if self.whitelist and rs.symbol_usdt not in self.whitelist:

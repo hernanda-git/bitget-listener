@@ -101,6 +101,9 @@ class RawSignal:
     channel: str = ""
     raw_text: str = ""
     image_path: str = ""
+    chart: dict = field(default_factory=dict)
+    movement_direction: str = ""
+    movement_waypoints: list[dict] = field(default_factory=list)
     is_management: bool = False
     management_action: str | None = None
 

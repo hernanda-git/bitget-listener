@@ -9,6 +9,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
+
+from bot_common.chart_vision import ChartVisionExtractor, chart_trade_fields, derive_protection_suggestion
 
 from src.domain.model import RawSignal
 from src.interfaces.ports import SignalSource
@@ -65,6 +68,12 @@ class TelethonSource(SignalSource):
         self.symbol_map = symbol_map
         self.queue: asyncio.Queue = asyncio.Queue()
         self._client = None
+        # Optional chart plugin. It is disabled unless a compatible vision key
+        # exists, keeping text signals deterministic and zero-cost.
+        self.chart_vision = ChartVisionExtractor() if (
+            os.getenv("CHART_VISION_ENABLED", "0").lower() in ("1", "true", "yes")
+            and (os.getenv("CHART_VISION_API_KEY") or os.getenv("GITLAWB_API_KEY"))
+        ) else None
         # LLM fallback is a no-op unless LLM_API_KEY is configured; when enabled it
         # only ever runs for messages the deterministic parser cannot classify.
         self.llm = SignalLLM()
@@ -78,6 +87,45 @@ class TelethonSource(SignalSource):
                 "TelethonSource cannot start — missing " + ", ".join(missing) +
                 ". A live Telethon session must be created interactively; see BLOCKED.md.")
 
+    async def _enrich_with_chart(self, message, signals: list[RawSignal], caption: str) -> list[RawSignal]:
+        """Parse an attached chart and enrich, never invent, a RawSignal."""
+        if self.chart_vision is None or not getattr(message, "media", None):
+            return signals
+        path = Path("/tmp") / f"bitget_chart_{int(message.id)}.jpg"
+        try:
+            downloaded = await self._client.download_media(message, file=str(path))
+            if not downloaded:
+                return signals
+            chart = await self.chart_vision.extract(downloaded, caption)
+            fields = chart_trade_fields(chart, caption)
+            suggestion = derive_protection_suggestion(chart, caption)
+            if fields["timeframe"] and not chart.get("timeframe"):
+                chart["timeframe"] = fields["timeframe"]
+            for rs in signals:
+                if not rs.symbol_usdt and fields["symbol_usdt"]:
+                    inst = self.symbol_map.resolve(fields["symbol_usdt"]) if self.symbol_map else None
+                    if inst is not None:
+                        rs.symbol_usdt, rs.base = inst.symbol, inst.base
+                if not rs.entry:
+                    rs.entry = fields["entry"]
+                if not rs.sl:
+                    rs.sl = fields["sl"]
+                if not rs.tp:
+                    rs.tp = fields["tp"]
+                if rs.side == "BUY" and fields["side"]:
+                    rs.side = fields["side"]
+                rs.chart = chart
+                rs.movement_direction = fields["movement_direction"]
+                rs.movement_waypoints = fields["movement_waypoints"]
+                rs.image_path = str(downloaded)
+                rs.raw["chart_executable"] = fields["executable"]
+                rs.raw["protection_suggestion"] = suggestion
+                rs.raw["chart_current_price"] = fields["current_price"]
+            return signals
+        except Exception as exc:  # chart enrichment must never kill Telegram intake
+            log.warning("chart enrichment failed for message %s: %s", getattr(message, "id", "?"), exc)
+            return signals
+
     async def start(self) -> None:
         self._require_creds()
         from telethon import TelegramClient, events   # lazy: tests never import telethon
@@ -86,10 +134,12 @@ class TelethonSource(SignalSource):
 
         @self._client.on(events.NewMessage(chats=self.channel))
         async def _handler(event):    # pragma: no cover - requires a live session
-            for rs in await parse_with_fallback(event.raw_text, message_id=event.id,
+            signals = await parse_with_fallback(event.raw_text, message_id=event.id,
                                     ts_ms=int(event.date.timestamp() * 1000),
                                     channel=self.channel, symbol_map=self.symbol_map,
-                                    llm=self.llm):
+                                    llm=self.llm)
+            signals = await self._enrich_with_chart(event.message, signals, event.raw_text)
+            for rs in signals:
                 rs.has_media = bool(event.media)
                 await self.queue.put(rs)
 
