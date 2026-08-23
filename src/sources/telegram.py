@@ -11,7 +11,7 @@ import logging
 import os
 from pathlib import Path
 
-from bot_common.chart_vision import ChartVisionExtractor, chart_trade_fields, derive_protection_suggestion
+from chart_signal_vision import ChartVisionExtractor, chart_trade_fields, derive_protection_suggestion
 
 from src.domain.model import RawSignal
 from src.interfaces.ports import SignalSource
