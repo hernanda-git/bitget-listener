@@ -20,6 +20,7 @@ import logging
 import os
 import time
 
+from chart_signal_vision import PendingSetup, PendingSetupWatcher
 from src.domain.model import Instrument, Position, RawSignal, Side, Signal, TradeDecision
 from src.eval.shadow_ledger import ShadowLedger
 from src.exchanges.rate_limit import RateLimitGate
@@ -54,6 +55,8 @@ class Orchestrator:
         self.orders = OrderService(adapter, paper=gate.paper, sizer=self.sizer)
         self.positions = PositionManager(adapter, self.orders, ledger, stream)
         self.rate_limit = rate_limit or RateLimitGate()
+        self.pending_watcher = PendingSetupWatcher()
+        self.pending_setups: dict[str, RawSignal] = {}
         self.private_stream = private_stream  # BitgetWS(private=True) when creds exist
         # Per-signal affordability (replaces the brittle static whitelist).
         self.tradability = tradability
@@ -146,6 +149,28 @@ class Orchestrator:
         """Single entry point for one inbound message."""
         if rs.is_management:
             return await self.handle_management(rs)
+
+        # Conditional chart setups are monitoring-only at this stage. They are
+        # registered with the shared tick watcher and never bypass the normal
+        # entry/risk path or turn a derived suggestion into an order.
+        pending_raw = (rs.raw or {}).get("pending_setup")
+        if pending_raw:
+            try:
+                setup = PendingSetup(**pending_raw)
+                self.pending_watcher.register(setup)
+                self.pending_setups[setup.setup_id] = rs
+                log.info("pending setup registered: %s %s %s", setup.symbol,
+                         setup.condition, setup.trigger_price)
+                if self.notifier is not None:
+                    with contextlib.suppress(Exception):
+                        await self.notifier.send(
+                            f"PENDING SETUP {setup.symbol}: {setup.condition} "
+                            f"{setup.trigger_price} ({setup.confirmation_ticks} ticks). "
+                            "No order placed.")
+                return {"status": "PENDING_SETUP", "setup_id": setup.setup_id,
+                        "symbol": setup.symbol, "trigger": setup.trigger_price}
+            except Exception as exc:
+                log.warning("invalid pending setup ignored: %s", exc)
 
         # Ban-prevention: if the rate-limit breaker is open (repeated 429s),
         # refuse to place NEW orders and park silently rather than risk an IP ban.
@@ -454,6 +479,17 @@ class Orchestrator:
         self._track_position_symbols()
 
     async def on_tick(self, symbol: str, mark: float) -> None:
+        # Pending setups are observed from the same public mark stream as open
+        # position protection. Confirmation is notification-only and cannot place
+        # an order from this callback.
+        for obs in self.pending_watcher.observe(symbol, mark):
+            log.info("pending setup %s %s mark=%s confirmations=%s reason=%s",
+                     obs.status, obs.symbol, obs.mark_price, obs.confirmations, obs.reason)
+            if self.notifier is not None and obs.status in ("CONFIRMED", "INVALIDATED"):
+                with contextlib.suppress(Exception):
+                    await self.notifier.send(
+                        f"{obs.status} SETUP {obs.symbol}: mark={obs.mark_price} "
+                        f"confirmations={obs.confirmations}. No order placed.")
         res = await self.positions.on_mark(symbol, mark)
         if res is not None and res.get("status") not in ("NO_POSITION", "REJECTED"):
             await self._book_close(symbol, res)

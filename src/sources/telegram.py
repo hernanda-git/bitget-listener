@@ -9,9 +9,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import asdict
 from pathlib import Path
 
-from chart_signal_vision import ChartVisionExtractor, chart_trade_fields, derive_protection_suggestion
+from chart_signal_vision import (
+    ChartVisionExtractor,
+    chart_trade_fields,
+    derive_protection_suggestion,
+    parse_pending_setup_text,
+)
 
 from src.domain.model import RawSignal
 from src.interfaces.ports import SignalSource
@@ -99,6 +105,8 @@ class TelethonSource(SignalSource):
             chart = await self.chart_vision.extract(downloaded, caption)
             fields = chart_trade_fields(chart, caption)
             suggestion = derive_protection_suggestion(chart, caption)
+            pending = parse_pending_setup_text(
+                caption, chart, caption, setup_id=f"{self.channel}:{int(message.id)}")
             if fields["timeframe"] and not chart.get("timeframe"):
                 chart["timeframe"] = fields["timeframe"]
             for rs in signals:
@@ -120,6 +128,7 @@ class TelethonSource(SignalSource):
                 rs.image_path = str(downloaded)
                 rs.raw["chart_executable"] = fields["executable"]
                 rs.raw["protection_suggestion"] = suggestion
+                rs.raw["pending_setup"] = asdict(pending) if pending is not None else None
                 rs.raw["chart_current_price"] = fields["current_price"]
             return signals
         except Exception as exc:  # chart enrichment must never kill Telegram intake
