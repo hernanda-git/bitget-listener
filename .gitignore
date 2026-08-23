@@ -21,6 +21,7 @@ dist/
 .audit.lock
 BLOCKED.md
 *.db
+armed_stops.json
 data/
 # OS
 .DS_Store
