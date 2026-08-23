@@ -345,8 +345,8 @@ async def test_sl_to_entry_moves_stop_to_breakeven():
     pos.sl_price = 57_000.0
     mgr.upsert(pos)
     res = await mgr.sl_to_entry("BTCUSDT")
-    assert res["sl"] == 60_000.0
-    assert fake.stops[-1][1] == 60_000.0
+    assert res["sl"] == pytest.approx(59_928.0)
+    assert fake.stops[-1][1] == pytest.approx(59_928.0)
 
 
 @pytest.mark.asyncio
@@ -413,9 +413,9 @@ async def test_armed_stop_writes_survive_without_pg(monkeypatch):
     pos = fake.seed_position(side=Side.BUY, entry=60_000.0)
     mgr.upsert(pos)
     res = await mgr.sl_to_entry("BTCUSDT")
-    assert res["sl"] == 60_000.0
+    assert res["sl"] == pytest.approx(59_928.0)
     # in-memory mirror must track the armed level even with no DB
-    assert mgr._armed["BTCUSDT"]["sl"] == 60_000.0
+    assert mgr._armed["BTCUSDT"]["sl"] == pytest.approx(59_928.0)
     await mgr.full_close("BTCUSDT")
     assert "BTCUSDT" not in mgr._armed  # removal reflected in the mirror
 

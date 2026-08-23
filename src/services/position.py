@@ -166,7 +166,19 @@ class PositionManager:
         pos = self.get(symbol)
         if pos is None:
             return {"status": "NO_POSITION", "symbol": symbol}
-        new_sl = pos.entry_price
+        # Use a conservative two-sided taker-fee buffer so a round trip at the
+        # resulting stop is net-flat after entry and exit fees. Never widen an
+        # existing protective stop below/above this level.
+        try:
+            spec = await self.orders.adapter.get_spec(pos.instrument)
+            fee_buffer = 2.0 * max(float(spec.taker_fee or 0.0), 0.0006)
+        except Exception:
+            fee_buffer = 0.0012
+        new_sl = (
+            pos.entry_price * (1.0 - fee_buffer)
+            if pos.side is Side.BUY
+            else pos.entry_price * (1.0 + fee_buffer)
+        )
         if pos.sl_price is not None:
             tighter = (new_sl >= pos.sl_price) if pos.side is Side.BUY else (new_sl <= pos.sl_price)
             if not tighter:

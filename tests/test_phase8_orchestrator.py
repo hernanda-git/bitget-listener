@@ -206,7 +206,7 @@ async def test_management_sl_to_entry_uses_the_open_position():
     await orch.source.start()
     await orch.source.push("sl to entry")
     await orch.run_once()
-    assert fake.stops[-1][1] == 60_000.0
+    assert fake.stops[-1][1] == pytest.approx(59_928.0)
 
 
 @pytest.mark.asyncio
