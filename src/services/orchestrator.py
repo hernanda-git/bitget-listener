@@ -229,6 +229,11 @@ class Orchestrator:
                 self.positions.upsert(Position(**{**pos.__dict__,
                     "sl_price": order.sl if order.sl is not None else pos.sl_price,
                     "tp_price": order.tp if order.tp is not None else pos.tp_price}))
+                # Persist the monitor levels immediately. Venue plan orders are
+                # unreliable on this account, so a restart must not lose the
+                # trader's exact SL/TP from the normal LIVE open path.
+                self.positions.persist_protection(order.instrument.symbol,
+                                                  order.sl, order.tp)
                 pos = self.positions.get(order.instrument.symbol)
             # Place the trader's EXACT SL/TP as resting plan orders on the venue
             # (BUG C: reduce-only, never auto-cancelled) as a best-effort belt-
@@ -513,6 +518,15 @@ class Orchestrator:
         # Arm bot-side SL/TP for any open position lacking it (trader's levels
         # from ARM_SL_TP). The WS monitor then closes on breach/target.
         await self._arm_open_protection()
+        # Reconcile immediately at boot, not only after the first 30-second tick.
+        # This prevents stale LIVE ledger rows from surviving a restart.
+        try:
+            live = await self.adapter.get_positions()
+            await self._reconcile_closed_ledger({
+                p.instrument.symbol for p in (live or []) if p.size > 0
+            })
+        except Exception as exc:  # noqa: BLE001 - never block startup on a read failure
+            log.warning("startup ledger reconciliation deferred: %s", exc)
 
     async def _position_reconciler(self) -> None:
         """Periodically reconcile the in-memory position cache against the
@@ -530,6 +544,7 @@ class Orchestrator:
                 live = await self.adapter.get_positions()
                 # Drop cached positions the exchange no longer has; refresh sizes.
                 live_syms = {p.instrument.symbol for p in (live or []) if p.size > 0}
+                await self._reconcile_closed_ledger(live_syms)
                 for sym in list(self.positions.positions.keys()):
                     if sym not in live_syms:
                         self.positions.positions.pop(sym, None)
@@ -554,6 +569,39 @@ class Orchestrator:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconciler must never kill the bot
                 log.debug("position reconciler error: %s", exc)
+
+    async def _reconcile_closed_ledger(self, live_syms: set[str]) -> None:
+        """Close LIVE ledger rows once the exchange confirms they are flat.
+
+        This is deliberately conservative: failed position reads abort the caller
+        before this method, paper rows are ignored, and a missing mark leaves the
+        row untouched. The resulting close is explicitly marked estimated because
+        an exchange-flat response does not provide the historical execution price.
+        """
+        from bot_common import repos
+
+        for row in list(self.ledger.open_trades()):
+            symbol = str(row["symbol"]).upper()
+            if row.get("paper") or symbol in live_syms:
+                continue
+            try:
+                mark = await self.adapter.get_mark_price(Instrument.from_token(symbol))
+                if mark is None or float(mark) <= 0:
+                    log.warning("ledger reconcile deferred for %s: no valid mark", symbol)
+                    continue
+                qty = float(row["qty"])
+                fee = self.sizer.estimate_close_fee(qty, float(mark), None)
+                closed = self.ledger.record_close(
+                    row["id"], exit_price=float(mark), close_fee=fee,
+                    exit_reason="exchange_flat_reconciled", estimated_exit=True)
+                repos.Positions.remove("bitget-listener", symbol)
+                repos.ArmedStops.remove("bitget-listener", symbol)
+                self.positions.positions.pop(symbol, None)
+                self.open_trade_ids.pop(symbol, None)
+                log.warning("ledger reconciled exchange-flat %s qty=%s at estimated mark=%s",
+                            symbol, qty, mark)
+            except Exception:
+                log.exception("ledger reconcile failed for exchange-flat %s", symbol)
 
     async def _equity_sampler(self) -> None:
         """Periodically append a wallet-equity sample so the dashboard can chart

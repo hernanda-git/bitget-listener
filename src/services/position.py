@@ -110,6 +110,17 @@ class PositionManager:
     def get(self, symbol: str) -> Position | None:
         return self.positions.get(symbol.upper())
 
+    def persist_protection(self, symbol: str, sl, tp) -> None:
+        """Persist the bot-side protection without placing a venue order.
+
+        The venue TPSL endpoint is best-effort and unreliable for this account.
+        Keeping the durable monitor mirror separate from that endpoint makes the
+        normal LIVE open path restart-safe.
+        """
+        sym = symbol.upper()
+        self._armed[sym] = {"sl": sl, "tp": tp}
+        self._armed_store.set(sym, sl, tp)
+
     async def sync(self) -> list[Position]:
         live = await self.adapter.get_positions()
         merged: list[Position] = []
