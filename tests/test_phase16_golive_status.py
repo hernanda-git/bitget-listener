@@ -33,7 +33,12 @@ def test_missing_file_is_fail_safe(tmp_path, monkeypatch):
     from src.notifier import golive_status
     importlib.reload(golive_status)
     out = golive_status.load()
-    assert out == {"probe_green": False, "tests_green": False}
+    assert out == {
+        "probe_green": False,
+        "tests_green": False,
+        "real_fee_observed": False,
+        "real_liq_price_observed": False,
+    }
 
 
 def test_stale_entry_expires(tmp_path, monkeypatch):

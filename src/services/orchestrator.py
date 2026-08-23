@@ -496,6 +496,20 @@ class Orchestrator:
                 log.info("rehydrated open_trade_ids from ledger: %s", self.open_trade_ids)
         except Exception as exc:  # noqa: BLE001 - never block startup on a read failure
             log.warning("open_trade_ids rehydrate failed (%s) — closes will re-book on open", exc)
+        # Rehydrate the fee/liquidation audit conditions after a restart. The
+        # stream observers are transient, but the evidence is durable in the
+        # exchange fills and authoritative PostgreSQL ledger.
+        try:
+            for fill in await self.adapter.get_fills():
+                self.gate.observe_fill(fill, persist=True)
+        except Exception as exc:  # noqa: BLE001 - audit seed must not block startup
+            log.warning("go-live fee evidence seed deferred: %s", exc)
+        try:
+            for row in self.ledger.closed_trades():
+                if not row.get("paper", True):
+                    self.gate.observe_liq_price(row.get("liq_price"))
+        except Exception as exc:  # noqa: BLE001 - audit seed must not block startup
+            log.warning("go-live liquidation evidence seed deferred: %s", exc)
         await self.source.start()
         if self.stream is not None:
             self.stream.on_fill = self.on_fill

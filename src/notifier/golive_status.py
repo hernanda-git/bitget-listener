@@ -25,7 +25,8 @@ from typing import Literal
 
 log = logging.getLogger(__name__)
 
-StatusKey = Literal["probe_green", "tests_green"]
+StatusKey = Literal["probe_green", "tests_green", "real_fee_observed",
+                    "real_liq_price_observed"]
 
 # Default location: repo-local, git-ignored intent (it is runtime state, not source).
 DEFAULT_PATH = os.getenv(
@@ -60,7 +61,12 @@ def stamp(key: StatusKey, path: str = DEFAULT_PATH) -> None:
 
 def load(path: str = DEFAULT_PATH, ttl_s: int = TTL_S) -> dict[StatusKey, bool]:
     """Return which conditions count as green within TTL. Fail-safe -> all False."""
-    out: dict[StatusKey, bool] = {"probe_green": False, "tests_green": False}
+    out: dict[StatusKey, bool] = {
+        "probe_green": False,
+        "tests_green": False,
+        "real_fee_observed": False,
+        "real_liq_price_observed": False,
+    }
     try:
         if not os.path.exists(path):
             return out

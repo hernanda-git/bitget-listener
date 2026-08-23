@@ -92,6 +92,10 @@ class GoLiveGate:
                 self.conditions.probe_green = True
             if status.get("tests_green"):
                 self.conditions.tests_green = True
+            if status.get("real_fee_observed", False):  # type: ignore[arg-type]
+                self.conditions.real_fee_observed = True
+            if status.get("real_liq_price_observed", False):  # type: ignore[arg-type]
+                self.conditions.real_liq_price_observed = True
         except Exception as exc:  # noqa: BLE001 - never let status break startup
             log.debug("go-live status seed skipped: %s", exc)
 
@@ -163,17 +167,39 @@ class GoLiveGate:
                 self.paper = True
 
     # ---------------------------------------------------------------- observers
-    def observe_fill(self, fill) -> None:
+    def observe_fill(self, fill, *, persist: bool = False) -> None:
         """Condition (d1): a real fill with a real non-zero fee."""
         if getattr(fill, "fee", 0) > 0 and not str(
                 getattr(fill, "client_order_id", "")).startswith("paper-"):
+            was_observed = self.conditions.real_fee_observed
             self.conditions.real_fee_observed = True
+            if persist and not was_observed:
+                self._stamp("real_fee_observed")
 
-    def observe_position(self, position) -> None:
+    def observe_position(self, position, *, persist: bool = False) -> None:
         """Condition (d2): a real, non-zero liquidation price."""
         liq = getattr(position, "liq_price", None)
         if liq is not None and liq > 0:
+            was_observed = self.conditions.real_liq_price_observed
             self.conditions.real_liq_price_observed = True
+            if persist and not was_observed:
+                self._stamp("real_liq_price_observed")
+
+    def observe_liq_price(self, liq_price: float | None) -> None:
+        """Seed BUG B from a persisted, real exchange liquidation price."""
+        if liq_price is not None and liq_price > 0:
+            was_observed = self.conditions.real_liq_price_observed
+            self.conditions.real_liq_price_observed = True
+            if not was_observed:
+                self._stamp("real_liq_price_observed")
+
+    @staticmethod
+    def _stamp(key: str) -> None:
+        try:
+            from src.notifier.golive_status import stamp
+            stamp(key)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001 - audit state is best effort
+            log.debug("go-live status stamp failed (%s): %s", key, exc)
 
     def observe_expectancy(self, shadow_ledger, min_samples: int = 10) -> None:
         self.conditions.expectancy_positive = shadow_ledger.expectancy_positive(
