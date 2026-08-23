@@ -203,25 +203,54 @@ class Orchestrator:
         order = result.get("order")
         if order is None:
             return
-        fee = self.sizer.estimate_open_fee(order.qty, order.price or signal.entry,
-                                          result.get("spec"))
-        tid = self.ledger.record_open(
-            symbol=order.instrument.symbol, side=order.side.value, qty=order.qty,
-            entry_price=order.price or signal.entry, open_fee=fee, leverage=order.leverage,
-            sl_price=order.sl, tp_price=order.tp, paper=(status == "PAPER"),
-            client_order_id=order.client_order_id, decision_id=str(signal.message_id or ""))
-        self.open_trade_ids[order.instrument.symbol] = tid
+        symbol = order.instrument.symbol
+        fill_price = next((result.get(key) for key in
+                           ("fill_price", "fill_average_price", "average_fill_price",
+                            "avg_price", "order_avg_price")
+                           if result.get(key) is not None), None)
+        if fill_price is None:
+            fill_price = order.price if order.price is not None else signal.entry
+        if fill_price is None or float(fill_price) <= 0:
+            # Never fabricate a zero/None fill. Keep reconciliation and protection
+            # alive, but leave the ledger open until the exchange supplies a price.
+            result["protection_pending"] = True
+            log.error("post-open bookkeeping pending for %s order_id=%s: no valid fill price",
+                      symbol, result.get("order_id"))
+        else:
+            try:
+                fill_price = float(fill_price)
+                actual_fee = result.get("fill_fee")
+                fee = (float(actual_fee) if actual_fee is not None and float(actual_fee) > 0
+                       else self.sizer.estimate_open_fee(order.qty, fill_price,
+                                                         result.get("spec")))
+                tid = self.ledger.record_open(
+                    symbol=symbol, side=order.side.value, qty=order.qty,
+                    entry_price=fill_price, open_fee=fee, leverage=order.leverage,
+                    sl_price=order.sl, tp_price=order.tp, paper=(status == "PAPER"),
+                    client_order_id=order.client_order_id,
+                    decision_id=str(signal.message_id or ""))
+                self.open_trade_ids[symbol] = tid
+            except Exception:
+                # Bookkeeping must not terminate signal handling after a confirmed
+                # exchange fill. Reconciliation below remains authoritative.
+                result["protection_pending"] = True
+                log.exception("post-open bookkeeping failed for %s order_id=%s",
+                              symbol, result.get("order_id"))
         # Paper mode runs with NO credentials, so it must never call a signed
         # endpoint. Track the position locally instead of syncing from the venue.
         # On a sync failure we also keep the local view so the position is never lost.
         if status == "PAPER":
-            self._local_position(order)
+            self._local_position(order, fill_price if fill_price is not None else signal.entry)
         else:
             try:
                 await self.positions.sync()
             except Exception as exc:
                 log.error("position sync failed after open (%s) — keeping local view", exc)
-                self._local_position(order)
+                if fill_price is not None and float(fill_price) > 0:
+                    self._local_position(order, fill_price)
+                else:
+                    log.error("local position deferred for %s order_id=%s: no valid entry price",
+                              symbol, result.get("order_id"))
             # The WS monitor is the primary SL/TP enforcement (the exchange tpsl
             # endpoint is unreliable). Seed the position's bot-side SL/TP from the
             # signal NOW so the monitor is armed even before/without venue attach.
@@ -257,6 +286,7 @@ class Orchestrator:
                               "UNPROTECTED on the venue (bot-side monitor is the ONLY "
                               "safety net, and it dies with this process)", exc,
                               order.instrument.symbol)
+                    result["protection_pending"] = True
                     if self.notifier is not None:
                         with contextlib.suppress(Exception):
                             await self.notifier.send(
@@ -271,10 +301,13 @@ class Orchestrator:
             with contextlib.suppress(Exception):
                 await self.notifier.send(TelegramNotifier.format_open(result))
 
-    def _local_position(self, order) -> None:
+    def _local_position(self, order, fill_price=None) -> None:
+        price = fill_price if fill_price is not None else order.price
+        if price is None or float(price) <= 0:
+            raise ValueError(f"cannot create local position for {order.instrument.symbol} without price")
         self.positions.upsert(Position(
             instrument=order.instrument, side=order.side, size=order.qty,
-            entry_price=order.price or 0.0,
+            entry_price=float(price),
             leverage=order.leverage, sl_price=order.sl, tp_price=order.tp,
             margin_mode=order.margin_mode))
 

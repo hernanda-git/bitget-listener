@@ -257,6 +257,36 @@ async def test_open_from_signal_live_places_and_sets_leverage():
 
 
 @pytest.mark.asyncio
+async def test_market_fill_resolves_exchange_price_and_real_fee_before_bookkeeping():
+    """A market OrderRequest has no order.price, so use the matching fill."""
+    fake = FakeExchangeAdapter()
+    fake.mark = 59_876.5
+    svc = OrderService(fake, paper=False)
+    res = await svc.open_from_signal(signal())
+    assert res["order"].price is None
+    assert res["fill_price"] == pytest.approx(59_876.5)
+    assert res["fill_fee"] > 0
+
+
+@pytest.mark.asyncio
+async def test_market_fill_uses_quantity_weighted_average():
+    fake = FakeExchangeAdapter()
+    svc = OrderService(fake, paper=False)
+    original = fake.get_fills
+
+    async def split_fills(instrument=None):
+        fills = await original(instrument)
+        f = fills[0]
+        from dataclasses import replace
+        return [replace(f, price=60_000.0, qty=f.qty / 2),
+                replace(f, price=60_100.0, qty=f.qty / 2)]
+
+    fake.get_fills = split_fills
+    res = await svc.open_from_signal(signal())
+    assert res["fill_price"] == pytest.approx(60_050.0)
+
+
+@pytest.mark.asyncio
 async def test_open_from_signal_dedupes_the_same_message():
     fake = FakeExchangeAdapter()
     svc = OrderService(fake, paper=False)

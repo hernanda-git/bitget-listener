@@ -11,6 +11,7 @@ Enforces, in order:
 from __future__ import annotations
 
 import logging
+import asyncio
 
 from src.domain.model import (
     Instrument,
@@ -109,8 +110,52 @@ class OrderService:
             "long" if order.side is Side.BUY else "short",
             cap=self.limits.max_leverage)
         order_id = await self.adapter.place_order(order)
-        return {"status": "PLACED", "order_id": order_id, "order": order, "sizing": sized,
-                "client_order_id": client_oid}
+        result = {"status": "PLACED", "order_id": order_id, "order": order, "sizing": sized,
+                  "client_order_id": client_oid}
+        # Market OrderRequest.price is intentionally None. Resolve the executed
+        # average from the exchange before post-open bookkeeping, otherwise a
+        # successful fill can reach fee math as abs(None).
+        fill = await self._resolve_open_fill(order, order_id)
+        if fill is not None:
+            result["fill_price"] = fill.price
+            result["fill_fee"] = fill.fee
+            result["fill"] = fill
+        return result
+
+    async def _resolve_open_fill(self, order: OrderRequest, order_id: str):
+        """Return the matching exchange fill, or None if it is not readable yet.
+
+        This is deliberately read-only and bounded. A missing fill is not treated
+        as a zero-price fill, and callers may use the explicitly supplied signal
+        entry only as a documented fallback while reconciliation continues.
+        """
+        get_fills = getattr(self.adapter, "get_fills", None)
+        if get_fills is None:
+            return None
+        for attempt in range(3):
+            try:
+                fills = await get_fills(order.instrument)
+                candidates = [f for f in (fills or [])
+                              if str(getattr(f, "order_id", "")) in (str(order_id), "")
+                              and (not getattr(f, "client_order_id", "")
+                                   or getattr(f, "client_order_id", "") == order.client_order_id)]
+                if candidates:
+                    # A market order may have multiple executions. Use a true
+                    # quantity-weighted average and the sum of real fees.
+                    qty = sum(float(getattr(f, "qty", 0) or 0) for f in candidates)
+                    if qty > 0:
+                        first = candidates[0]
+                        avg = sum(float(f.price) * float(f.qty) for f in candidates) / qty
+                        first.price = avg
+                        first.qty = qty
+                        first.fee = sum(float(getattr(f, "fee", 0) or 0) for f in candidates)
+                        return first
+            except Exception as exc:  # noqa: BLE001 - reconciliation handles lag/errors
+                log.warning("fill read after open failed for %s/%s: %s",
+                            order.instrument.symbol, order_id, exc)
+            if attempt < 2:
+                await asyncio.sleep(0.2)
+        return None
 
     # ---------------------------------------------------------------- protective
     async def attach_protective(self, position: Position, sl: float | None,

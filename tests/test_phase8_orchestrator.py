@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from src.config.db import InMemoryConfigStore
+from src.domain.model import RawSignal
 from src.eval.shadow_ledger import ShadowLedger
 from src.exchanges.fake import FakeExchangeAdapter
 from src.notifier.golive import GateConditions, GoLiveGate
@@ -81,6 +82,26 @@ async def test_duplicate_symbol_position_is_skipped():
     await orch.source.push(LONG, message_id=9)
     await orch.run_once()
     assert any("already in a" in s["reason"] for s in orch.skipped)
+
+
+@pytest.mark.asyncio
+async def test_post_open_bookkeeping_exception_does_not_escape_or_drop_position():
+    fake, orch, _, _, _ = build(paper=False)
+
+    class FailingLedger(TradeLedger):
+        def record_open(self, *args, **kwargs):
+            raise RuntimeError("ledger unavailable")
+
+    orch.ledger = FailingLedger(":memory:")
+    raw = RawSignal(symbol_usdt="BTCUSDT", base="BTC", side="BUY", entry=60_000,
+                    sl=57_000, tp=66_000, leverage=10, message_id=99)
+    sig = orch.to_signal(raw)
+    assert sig is not None
+    result = await orch.orders.open_from_signal(sig)
+    await orch._after_open(sig, result)
+    assert result["status"] == "PLACED"
+    assert orch.positions.get("BTCUSDT") is not None
+    assert orch.positions.get("BTCUSDT").entry_price > 0
 
 
 @pytest.mark.asyncio
