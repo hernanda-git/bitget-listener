@@ -125,8 +125,10 @@ class TelethonSource(SignalSource):
         """Parse an attached chart and enrich, never invent, a RawSignal."""
         if self.chart_vision is None or not getattr(message, "media", None):
             return signals
-        path = Path("/tmp") / f"bitget_chart_{int(message.id)}.jpg"
         try:
+            media_root = Path(os.getenv("CHART_MEDIA_DIR", "/var/lib/bitget-listener/media"))
+            media_root.mkdir(parents=True, exist_ok=True)
+            path = media_root / f"{int(message.id)}.jpg"
             downloaded = await self._client.download_media(message, file=str(path))
             if not downloaded:
                 return signals
