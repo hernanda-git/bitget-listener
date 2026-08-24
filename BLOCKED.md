@@ -45,3 +45,10 @@ Continuation code adds `bc_signal_receipts`, `bc_trace_events`, and `bot_common.
 - Trace endpoint requires the dashboard password.
 - Fresh Bitget probe is `GREEN=11 WARN=2 RED=0` after accepting the current ticker snapshot heartbeat response.
 - Bitget branch latest pushed commit: `006ac721f1b927ec0189509ba23107803107cfef`.
+
+## Complete evidence chain
+
+- Receipts preserve raw text, hashes, reply context, media metadata, process/host identity, schema version, and timestamps.
+- Trace read-back includes the receipt row plus ordered parser, LLM, vision, decision, gate, order, fill, protection, position, close, bookkeeping, and evaluation evidence where available.
+- Downloaded chart media is hashed and recorded with path and byte length. Production must use durable access-controlled media storage instead of `/tmp` before relying on media replay.
+- Latest pushed Bitget commit: `f01ba384b573c0f60bd3960a9ab3a0723b354aac`.
