@@ -50,5 +50,5 @@ Continuation code adds `bc_signal_receipts`, `bc_trace_events`, and `bot_common.
 
 - Receipts preserve raw text, hashes, reply context, media metadata, process/host identity, schema version, and timestamps.
 - Trace read-back includes the receipt row plus ordered parser, LLM, vision, decision, gate, order, fill, protection, position, close, bookkeeping, and evaluation evidence where available.
-- Downloaded chart media is hashed and recorded with path and byte length. Production must use durable access-controlled media storage instead of `/tmp` before relying on media replay.
-- Latest pushed Bitget commit: `f01ba384b573c0f60bd3960a9ab3a0723b354aac`.
+- Downloaded chart media now defaults to durable `/var/lib/bitget-listener/media`, configurable with `CHART_MEDIA_DIR`, and is recorded with path, byte length, and SHA-256. The funded service has not been restarted, so live artifact-path verification remains part of the paper/demo rollout.
+- Latest pushed Bitget commit: `841939ee7eb8347cfa077840c1d6764c4448ec70`.
