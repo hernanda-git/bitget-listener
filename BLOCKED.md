@@ -23,7 +23,7 @@ The running services were not restarted. A paper/demo rollout must be separately
 
 ## Shared package versioning and migration gate
 
-Continuation code adds `bc_signal_receipts`, `bc_trace_events`, and `bot_common.repos.Traces` under `/opt/bots/bot_common`. The directory is not a Git checkout, so the change is not represented by the pushed Bitget commit `efa90358cafb87292283836c989db6a69acc6724`. The DDL and repository code compile and fake repository tests pass, but the live Postgres schema has not been migrated. Do not restart or promote the funded service until this shared package is placed under the deployment's versioned release mechanism, the migration is reviewed, and a paper/demo startup proves receipt and stage read-back.
+Continuation code adds `bc_signal_receipts`, `bc_trace_events`, and `bot_common.repos.Traces` under `/opt/bots/bot_common`. The directory is now a local Git repository at commit `e0bcbf26b02ff5d3628f2fa7d90e6a7661e5e5e3`, but it has no configured remote or deployment release integration. The DDL and repository code compile and fake repository tests pass, but the live Postgres schema has not been migrated. Do not restart or promote the funded service until this shared package is attached to the deployment's versioned release mechanism, the migration is reviewed, and a paper/demo startup proves receipt and stage read-back.
 
 ## Continuation safety work completed locally
 
@@ -33,3 +33,15 @@ Continuation code adds `bc_signal_receipts`, `bc_trace_events`, and `bot_common.
 - Entry and close order builders explicitly use `crossed` margin mode.
 - Repeatable 100-message fake composition-root replay passes.
 - Dashboard mobile/browser verification passes in an isolated paper server; no funded service was restarted.
+
+## Code-review remediation completed locally
+
+- Catch-up receipts are durable before parsing.
+- Invalid pending setups and pending direction conflicts fail closed.
+- LLM direction is fail-closed and raw/model direction metadata is persisted.
+- Partial close ledger legs preserve remaining open quantity.
+- Close read-back retries and zero/oversized rounded closes are rejected.
+- psycopg2 compatibility and canonical duplicate trace IDs are covered.
+- Trace endpoint requires the dashboard password.
+- Fresh Bitget probe is `GREEN=11 WARN=2 RED=0` after accepting the current ticker snapshot heartbeat response.
+- Bitget branch latest pushed commit: `006ac721f1b927ec0189509ba23107803107cfef`.
