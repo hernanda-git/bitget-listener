@@ -90,15 +90,15 @@ class SignalLLM:
         return obj
 
     def _to_rawsignal(self, obj: dict, message_id, ts_ms, source, channel,
-                      symbol_map: SymbolMap | None) -> RawSignal | None:
+                      symbol_map: SymbolMap | None,
+                      raw_direction: str | None = None) -> RawSignal | None:
         sym_raw = str(obj.get("symbol") or "").strip().lstrip("$#").upper()
         if not sym_raw:
             return None
         inst = (symbol_map.resolve(sym_raw) if symbol_map is not None
                 else Instrument.from_token(sym_raw))
         side = str(obj.get("side") or "").upper()
-        if side not in ("BUY", "SELL"):
-            side = "BUY"
+        model_direction = side if side in ("BUY", "SELL") else ""
         action = str(obj.get("action") or "none").lower()
         mgmt = action if action in ("sl_to_entry", "partial", "full_close",
                                      "cancel_pending") else None
@@ -109,6 +109,10 @@ class SignalLLM:
             entry = None
         if action == "entry" and entry is None:
             mgmt = None  # LLM said entry but gave no price -> not trustworthy
+        if action == "entry" and not model_direction:
+            return None
+        if not model_direction:
+            model_direction = "BUY"  # management actions do not execute direction
         try:
             sl = float(obj["sl"]) if obj.get("sl") not in (None, "") else None
         except (ValueError, TypeError):
@@ -119,16 +123,25 @@ class SignalLLM:
             tp = None
         return RawSignal(
             symbol_usdt=inst.symbol, base=inst.base,
-            side=side if mgmt is None else side,
+            side=model_direction,
             entry=entry, sl=sl, tp=tp, notional_usd=0.0, leverage=1,
-            confidence=0.0, raw={"text": "", "llm": True},
+            confidence=0.0, raw={
+                "text": "", "llm": True,
+                "model_direction": model_direction if action == "entry" else "",
+                "raw_direction": raw_direction or "",
+                "direction_conflict": bool(
+                    raw_direction in ("BUY", "SELL")
+                    and raw_direction != model_direction
+                ),
+            },
             source=source, message_id=message_id, ts_ms=ts_ms,
             channel=channel, raw_text="", is_management=mgmt is not None,
             management_action=mgmt,
         )
 
     async def parse(self, text: str, message_id=None, ts_ms=None, source="fattyfatclub",
-                    channel="", symbol_map: SymbolMap | None = None) -> RawSignal | None:
+                    channel="", symbol_map: SymbolMap | None = None,
+                    raw_direction: str | None = None) -> RawSignal | None:
         if not self.enabled:
             return None
         try:
@@ -155,7 +168,8 @@ class SignalLLM:
         if obj is None:
             log.warning("[llm-fallback] no JSON in response — using deterministic")
             return None
-        rs = self._to_rawsignal(obj, message_id, ts_ms, source, channel, symbol_map)
+        rs = self._to_rawsignal(obj, message_id, ts_ms, source, channel, symbol_map,
+                                raw_direction=raw_direction)
         if rs is None:
             return None
         log.info("[llm-fallback] recovered signal for %s action=%s", rs.symbol_usdt,
@@ -182,8 +196,15 @@ async def parse_with_fallback(text: str, message_id=None, ts_ms=None,
     if confident or llm is None or not llm.enabled:
         return deterministic
     # Deterministic found nothing usable -> ask the LLM once.
+    raw_directions = set()
+    for signal in deterministic:
+        raw_directions.update((signal.raw or {}).get("direction_evidence", []))
+    if len(raw_directions) > 1:
+        return deterministic
+    raw_direction = next(iter(raw_directions)) if len(raw_directions) == 1 else None
     rs = await llm.parse(text, message_id=message_id, ts_ms=ts_ms, source=source,
-                         channel=channel, symbol_map=symbol_map)
+                         channel=channel, symbol_map=symbol_map,
+                         raw_direction=raw_direction)
     if rs is None:
         return deterministic
     return [rs]

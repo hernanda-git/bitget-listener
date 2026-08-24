@@ -53,10 +53,13 @@ async def test_limit_conditional_and_entry_margin_mode_are_explicit():
 
 
 class _Cursor:
-    def __init__(self, inserted=True):
+    def __init__(self, inserted=True, row=None):
         self.inserted = inserted
+        self.row = row
 
     def fetchone(self):
+        if self.row is not None:
+            return self.row
         return {"id": 1} if self.inserted else None
 
     def fetchall(self):
@@ -66,10 +69,14 @@ class _Cursor:
 class _Conn:
     def __init__(self):
         self.sql = []
+        self.params = []
         self.inserted = True
 
     def execute(self, sql, params=()):
         self.sql.append(sql)
+        self.params.append(params)
+        if "SELECT trace_id FROM bc_signal_receipts" in sql:
+            return _Cursor(row={"trace_id": "fattyfatclub:7"})
         if "bc_signal_receipts" in sql:
             cur = _Cursor(self.inserted)
             self.inserted = False
@@ -100,6 +107,9 @@ def test_postgres_trace_repository_is_idempotent_and_has_readback(monkeypatch):
                               "GATE_EVALUATED", "REJECTED", "DIRECTION_CONFLICT")
     assert any("bc_signal_receipts" in sql for sql in conn.sql)
     assert any("bc_trace_events" in sql for sql in conn.sql)
+    received_stage_params = [p for sql, p in zip(conn.sql, conn.params)
+                             if "bc_trace_events" in sql and "RECEIVED" in p]
+    assert received_stage_params[-1][0] == "fattyfatclub:7"
 
 
 def test_postgres_schema_contains_trace_tables():

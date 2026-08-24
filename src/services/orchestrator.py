@@ -76,14 +76,25 @@ class Orchestrator:
         self._running = False
         self.report_interval_s = float(os.getenv("BITGET_REPORT_INTERVAL_S", "21600"))
 
-    def _trace(self, rs: RawSignal, stage: str, status: str = "OK",
-               reason: str = "", payload: dict | None = None) -> None:
+    async def _trace(self, rs: RawSignal, stage: str, status: str = "OK",
+                     reason: str = "", payload: dict | None = None) -> None:
         store = getattr(self, "ledger", None)
         recorder = getattr(store, "record_stage", None)
         if callable(recorder):
             mid = int(rs.message_id or 0)
             channel = getattr(rs, "channel", "") or getattr(rs, "source", "fattyfatclub")
-            recorder(f"{channel}:{mid}", mid, stage, status, reason, payload)
+            await asyncio.to_thread(recorder, f"{channel}:{mid}", mid, stage,
+                                    status, reason, payload)
+
+    async def _ledger_call(self, method, *args, **kwargs):
+        """Retry short ledger writes without blocking the event loop."""
+        for attempt in range(3):
+            try:
+                return await asyncio.to_thread(method, *args, **kwargs)
+            except Exception:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.1 * (attempt + 1))
 
     # ------------------------------------------------------------------- guards
     def _sync_paper_flag(self) -> None:
@@ -193,13 +204,13 @@ class Orchestrator:
 
     async def handle(self, rs: RawSignal) -> dict:
         """Single entry point for one inbound message."""
-        self._trace(rs, "PARSED", "OK", payload={
+        await self._trace(rs, "PARSED", "OK", payload={
             "symbol": rs.symbol_usdt, "side": rs.side, "has_media": bool(rs.has_media),
         })
         if rs.is_management:
             result = await self.handle_management(rs)
-            self._trace(rs, "MANAGEMENT", result.get("status", "UNKNOWN"),
-                        result.get("reason", ""), result)
+            await self._trace(rs, "MANAGEMENT", result.get("status", "UNKNOWN"),
+                              result.get("reason", ""), result)
             return result
 
         # Conditional chart setups are monitoring-only at this stage. They are
@@ -207,6 +218,20 @@ class Orchestrator:
         # entry/risk path or turn a derived suggestion into an order.
         pending_raw = (rs.raw or {}).get("pending_setup")
         if pending_raw:
+            evidence = set((rs.raw or {}).get("direction_evidence", []))
+            raw_direction = str((rs.raw or {}).get("raw_direction") or "").upper()
+            model_direction = str((rs.raw or {}).get("model_direction") or "").upper()
+            direction_conflict = (
+                bool((rs.raw or {}).get("direction_conflict"))
+                or len(evidence) > 1
+                or (raw_direction in {"BUY", "SELL"}
+                    and model_direction in {"BUY", "SELL"}
+                    and raw_direction != model_direction)
+            )
+            if direction_conflict:
+                await self._trace(rs, "GATE_EVALUATED", "REJECTED", "DIRECTION_CONFLICT")
+                await self._trace(rs, "TERMINAL", "REJECTED", "DIRECTION_CONFLICT")
+                return {"status": "REJECTED", "reason": "DIRECTION_CONFLICT"}
             try:
                 setup = PendingSetup(**pending_raw)
                 self.pending_watcher.register(setup)
@@ -214,8 +239,8 @@ class Orchestrator:
                 persist = getattr(self.ledger, "save_pending_setup", None)
                 if callable(persist):
                     persist(setup.setup_id, asdict(setup))
-                self._trace(rs, "GATE_EVALUATED", "PENDING", "PENDING_SETUP",
-                            {"setup_id": setup.setup_id, "trigger": setup.trigger_price})
+                await self._trace(rs, "GATE_EVALUATED", "PENDING", "PENDING_SETUP",
+                                  {"setup_id": setup.setup_id, "trigger": setup.trigger_price})
                 log.info("pending setup registered: %s %s %s", setup.symbol,
                          setup.condition, setup.trigger_price)
                 if self.notifier is not None:
@@ -227,7 +252,13 @@ class Orchestrator:
                 return {"status": "PENDING_SETUP", "setup_id": setup.setup_id,
                         "symbol": setup.symbol, "trigger": setup.trigger_price}
             except Exception as exc:
-                log.warning("invalid pending setup ignored: %s", exc)
+                reason = "INVALID_PENDING_SETUP"
+                log.warning("invalid pending setup rejected: %s", exc)
+                await self._trace(rs, "GATE_EVALUATED", "REJECTED", reason,
+                                  {"error": str(exc)})
+                await self._trace(rs, "TERMINAL", "REJECTED", reason,
+                                  {"error": str(exc)})
+                return {"status": "REJECTED", "reason": reason}
 
         # Ban-prevention: if the rate-limit breaker is open (repeated 429s),
         # refuse to place NEW orders and park silently rather than risk an IP ban.
@@ -245,8 +276,8 @@ class Orchestrator:
 
         reason = await self.guard(rs)
         if reason is not None:
-            self._trace(rs, "GATE_EVALUATED", "REJECTED", reason)
-            self._trace(rs, "TERMINAL", "REJECTED", reason)
+            await self._trace(rs, "GATE_EVALUATED", "REJECTED", reason)
+            await self._trace(rs, "TERMINAL", "REJECTED", reason)
             self.skipped.append({"symbol": rs.symbol_usdt, "reason": reason})
             log.info("skipping signal: %s", reason)
             if self.notifier is not None:
@@ -258,7 +289,7 @@ class Orchestrator:
         signal = self.to_signal(rs)
         if signal is None:
             reason = "unparseable signal"
-            self._trace(rs, "TERMINAL", "REJECTED", reason)
+            await self._trace(rs, "TERMINAL", "REJECTED", reason)
             self.skipped.append({"symbol": rs.symbol_usdt, "reason": reason})
             if self.notifier is not None:
                 with contextlib.suppress(Exception):
@@ -276,9 +307,9 @@ class Orchestrator:
         self._sync_paper_flag()
         multiplier = self.shadow.size_multiplier(signal.instrument.symbol)
         result = await self.orders.open_from_signal(signal, size_multiplier=multiplier)
-        self._trace(rs, "ORDER_SUBMITTED" if result.get("status") in ("PLACED", "PAPER") else "ORDER_FAILED",
-                    "OK" if result.get("status") in ("PLACED", "PAPER") else "REJECTED",
-                    result.get("reason", ""), {"status": result.get("status"), "order_id": result.get("order_id")})
+        await self._trace(rs, "ORDER_SUBMITTED" if result.get("status") in ("PLACED", "PAPER") else "ORDER_FAILED",
+                          "OK" if result.get("status") in ("PLACED", "PAPER") else "REJECTED",
+                          result.get("reason", ""), {"status": result.get("status"), "order_id": result.get("order_id")})
         await self._after_open(signal, result)
         return result
 
@@ -313,7 +344,7 @@ class Orchestrator:
                 fee = (float(actual_fee) if actual_fee is not None and float(actual_fee) > 0
                        else self.sizer.estimate_open_fee(order.qty, fill_price,
                                                          result.get("spec")))
-                tid = self.ledger.record_open(
+                tid = await self._ledger_call(self.ledger.record_open,
                     symbol=symbol, side=order.side.value, qty=order.qty,
                     entry_price=fill_price, open_fee=fee, leverage=order.leverage,
                     sl_price=order.sl, tp_price=order.tp, paper=(status == "PAPER"),
@@ -439,9 +470,14 @@ class Orchestrator:
                         TelegramNotifier.format_tp_modify(symbol, res.get("tp")))
         else:
             res = {"status": "UNKNOWN_ACTION", "action": action}
+        pre_close_position = self.positions.get(symbol) if action in ("full_close", "partial") else None
         if action in ("full_close", "partial") and res.get("status") not in (
                 "NO_POSITION", "REJECTED"):
-            await self._book_close(symbol, res)
+            booked = await self._book_close(symbol, res)
+            if not booked and pre_close_position is not None:
+                self.positions.upsert(pre_close_position)
+                self.positions.persist_protection(
+                    symbol, pre_close_position.sl_price, pre_close_position.tp_price)
         # Re-sync the WS price feed: a close frees a symbol, a partial keeps it.
         self._track_position_symbols()
         return res
@@ -452,7 +488,7 @@ class Orchestrator:
             return next(iter(self.positions.positions))
         return None
 
-    async def _book_close(self, symbol: str, res: dict) -> None:
+    async def _book_close(self, symbol: str, res: dict) -> bool:
         tid = self.open_trade_ids.get(symbol)
         if tid is None:
             # DEFENSE-IN-DEPTH: the symbol may not be in the in-memory map (e.g. a
@@ -471,7 +507,7 @@ class Orchestrator:
         if tid is None:
             log.error("cannot book close for %s: no open trade in ledger — "
                       "leaving position as-is (exchange already closed it)", symbol)
-            return
+            return False
         if res.get("status") == "PAPER":
             mark = self.stream.mark_price(symbol) if self.stream is not None else None
             if mark is None:
@@ -479,24 +515,40 @@ class Orchestrator:
                     mark = await self.adapter.get_mark_price(Instrument.from_token(symbol))
             if mark is None or float(mark) <= 0:
                 log.error("cannot book paper close for %s without a mark", symbol)
-                return
+                return False
             res = {**res, "close_fill_price": float(mark)}
         elif not res.get("exchange_confirmed"):
             log.error("cannot book close for %s without exchange confirmation — leaving trade open", symbol)
-            return
+            return False
         mark = res.get("close_fill_price")
         if mark is None or float(mark) <= 0:
             log.error("cannot book close for %s without authoritative fill price — leaving trade open", symbol)
-            return
-        close_fee = res.get("close_fill_fee")
-        if close_fee is None:
-            close_fee = self.sizer.estimate_close_fee(self.ledger.get(tid)["qty"], mark, None)
-        row = self.ledger.record_close(
-            tid, exit_price=mark, close_fee=close_fee,
-            exit_reason=res.get("reason") or res.get("action", "close"))
+            return False
+        try:
+            close_fee = res.get("close_fill_fee")
+            if close_fee is None:
+                trade_row = await self._ledger_call(self.ledger.get, tid)
+                close_fee = self.sizer.estimate_close_fee(trade_row["qty"], mark, None)
+            reason = res.get("reason") or res.get("action", "close")
+            close_qty = res.get("closed_qty")
+            if (res.get("action") == "partial" and not res.get("exchange_flat")
+                    and close_qty is not None
+                    and hasattr(self.ledger, "record_partial_close")):
+                row = await self._ledger_call(
+                    self.ledger.record_partial_close,
+                    tid, close_qty, mark, close_fee, exit_reason=reason)
+            else:
+                row = await self._ledger_call(
+                    self.ledger.record_close, tid, exit_price=mark,
+                    close_fee=close_fee, exit_reason=reason)
+        except Exception as exc:
+            log.error("close ledger write failed for %s after exchange confirmation: %s",
+                      symbol, exc)
+            return False
         self.daily_realized += (row.net_usd or 0.0)
         self.shadow.record(symbol, (row.net_usd or 0.0) > 0, row.net_usd or 0.0)
-        self.open_trade_ids.pop(symbol, None)
+        if not (res.get("action") == "partial" and not res.get("exchange_flat")):
+            self.open_trade_ids.pop(symbol, None)
         self.gate.observe_expectancy(self.shadow)
         if self.notifier is not None:
             from src.notifier.telegram import TelegramNotifier
@@ -519,6 +571,7 @@ class Orchestrator:
                         TelegramNotifier.format_partial(row, frac))
                 else:
                     await self.notifier.send(TelegramNotifier.format_exit(row))
+        return True
 
     # --------------------------------------------------------------- stream hooks
     async def on_fill(self, fill) -> None:

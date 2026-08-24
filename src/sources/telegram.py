@@ -43,7 +43,8 @@ class FakeSignalSource(SignalSource):
         self.started = True
         for i, text in enumerate(self.messages, start=1):
             if self.trace_store is not None:
-                self.trace_store.record_received(f"fake:{i}", i, "fake", text)
+                await asyncio.to_thread(
+                    self.trace_store.record_received, f"fake:{i}", i, "fake", text)
             for rs in parse_signals(text, message_id=i, channel="fake", symbol_map=self.symbol_map):
                 await self.queue.put(rs)
 
@@ -56,7 +57,8 @@ class FakeSignalSource(SignalSource):
     async def push(self, text: str, message_id: int | None = None) -> list[RawSignal]:
         mid = message_id if message_id is not None else int(uuid.uuid4().int % 2_000_000_000)
         if self.trace_store is not None:
-            self.trace_store.record_received(f"fake:{mid}", mid, "fake", text)
+            await asyncio.to_thread(
+                self.trace_store.record_received, f"fake:{mid}", mid, "fake", text)
         sigs = parse_signals(text, message_id=mid, channel="fake", symbol_map=self.symbol_map)
         for rs in sigs:
             await self.queue.put(rs)
@@ -152,7 +154,7 @@ class TelethonSource(SignalSource):
         @self._client.on(events.NewMessage(chats=self.channel))
         async def _handler(event):    # pragma: no cover - requires a live session
             if self.trace_store is not None:
-                self.trace_store.record_received(
+                await asyncio.to_thread(self.trace_store.record_received,
                     f"{self.channel}:{int(event.id)}", int(event.id), self.channel,
                     event.raw_text or "", bool(event.media),
                     source_timestamp=event.date.isoformat() if event.date else None,
@@ -195,6 +197,14 @@ class TelethonSource(SignalSource):
                 text = msg.message or (msg.text or "")
                 if not text.strip():
                     continue
+                if self.trace_store is not None:
+                    await asyncio.to_thread(
+                        self.trace_store.record_received,
+                        f"{self.channel}:{int(msg.id)}", int(msg.id), self.channel,
+                        text, bool(msg.media),
+                        source_timestamp=msg.date.isoformat() if msg.date else None,
+                        reply_to_message_id=getattr(msg, "reply_to_msg_id", None),
+                    )
                 for rs in await parse_with_fallback(text, message_id=msg.id,
                                         ts_ms=int(msg.date.timestamp() * 1000) if msg.date else None,
                                         channel=self.channel, symbol_map=self.symbol_map,
@@ -203,6 +213,13 @@ class TelethonSource(SignalSource):
                     # posted while the bot was down. Replaying old ENTRY signals would
                     # open stale positions, so only management is processed here.
                     if not rs.is_management:
+                        if self.trace_store is not None:
+                            await asyncio.to_thread(
+                                self.trace_store.record_stage,
+                                f"{self.channel}:{int(msg.id)}", int(msg.id),
+                                "TERMINAL", "REJECTED", "CATCHUP_ENTRY_NOT_REPLAYED",
+                                {"historical": True},
+                            )
                         continue
                     rs.has_media = bool(msg.media)
                     await self.queue.put(rs)

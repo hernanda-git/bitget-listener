@@ -108,6 +108,20 @@ class PostgresLedger:
                         open_fee=found["open_fee"], close_fee=close_fee,
                         exit_price=exit_price, net_usd=res.get("net_usd"))
 
+    def record_partial_close(self, trade_id: int, close_qty: float, exit_price: float,
+                             close_fee: float, exit_reason: str = "") -> TradeRow:
+        row = self.get(trade_id)
+        if row is None or row.get("closed_at_ms") is not None:
+            raise KeyError(f"no open trade {trade_id}")
+        res = repos.Trades.record_partial_close(
+            trade_id, close_qty, exit_price, close_fee, bot=self.bot,
+            exit_reason=exit_reason)
+        alloc_open_fee = float(row["open_fee"]) * (close_qty / float(row["qty"]))
+        return TradeRow(id=trade_id, symbol=row["symbol"], side=row["side"], qty=close_qty,
+                        entry_price=row["entry_price"], open_fee=alloc_open_fee,
+                        close_fee=close_fee, exit_price=exit_price,
+                        net_usd=res.get("net_usd"))
+
     def record_outcome(self, pair: str, win: bool, net_usd: float = 0.0) -> None:
         # The shadow ledger calls this; we fold it into the trade's pair_outcomes
         # equivalent by appending a synthetic closed-trade-less outcome row is not

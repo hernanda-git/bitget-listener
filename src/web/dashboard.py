@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Body, FastAPI, Header, HTTPException
@@ -126,12 +127,13 @@ def create_app(orchestrator, password: str | None = None) -> FastAPI:
         })
 
     @app.get("/api/trace/{trace_id:path}")
-    async def trace(trace_id: str):
+    async def trace(trace_id: str, x_dash_password: str | None = Header(None)):
         """Read-only ordered cross-stage trace for operator/audit tooling."""
+        require_auth(x_dash_password, f"trace {trace_id}")
         getter = getattr(orchestrator.ledger, "get_trace", None)
         if not callable(getter):
-            return JSONResponse({"trace_id": trace_id, "stages": []})
-        stages = getter(trace_id)
+            raise HTTPException(status_code=503, detail="trace store unavailable")
+        stages = await asyncio.to_thread(getter, trace_id)
         return JSONResponse({"trace_id": trace_id, "stages": stages})
 
     @app.get("/", response_class=HTMLResponse)

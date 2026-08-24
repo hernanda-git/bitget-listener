@@ -262,7 +262,11 @@ def parse_signals(text: str, message_id: int | None = None, ts_ms: int | None = 
         nums = _extract_num_map(clause)
         evidence = _direction_evidence(clause)
 
-        mgmt = _management_action(clause)
+        conditional_language = bool(re.search(
+            r"\bhold\s+(?:above|below)\b|\bpullback\b|\bretrace\b|"
+            r"\bbuy\s+the\s+dip\b|\bbreakout\s+(?:above|below)\b", clause,
+            re.IGNORECASE))
+        mgmt = None if conditional_language else _management_action(clause)
         is_entry = side is not None and nums.get("entry") is not None
         if is_entry:
             mgmt = None

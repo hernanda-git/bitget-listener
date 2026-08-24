@@ -280,6 +280,40 @@ class TradeLedger:
                         entry_price=row["entry_price"], open_fee=row["open_fee"],
                         close_fee=close_fee, exit_price=exit_price, net_usd=net)
 
+    def record_partial_close(self, trade_id: int, close_qty: float, exit_price: float,
+                             close_fee: float, exit_reason: str = "") -> TradeRow:
+        """Realize one close leg while preserving the remaining open quantity."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM trades_log WHERE id=? AND closed_at_ms IS NULL",
+                               (trade_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"no open trade {trade_id}")
+            if close_qty <= 0 or close_qty >= row["qty"]:
+                raise ValueError("partial close quantity must be >0 and < open quantity")
+            alloc_open_fee = row["open_fee"] * (close_qty / row["qty"])
+            remaining_qty = row["qty"] - close_qty
+            remaining_fee = row["open_fee"] - alloc_open_fee
+            direction = 1 if row["side"].upper() in ("BUY", "LONG") else -1
+            gross = (exit_price - row["entry_price"]) * close_qty * direction
+            net = gross - (alloc_open_fee + close_fee)
+            now = int(time.time() * 1000)
+            conn.execute("UPDATE trades_log SET qty=?, open_fee=? WHERE id=?",
+                         (remaining_qty, remaining_fee, trade_id))
+            conn.execute(
+                "INSERT INTO trades_log (bot,symbol,side,qty,entry_price,exit_price,leverage,"
+                "open_fee,close_fee,gross_usd,net_usd,sl_price,tp_price,liq_price,exit_reason,"
+                "estimated_exit,paper,opened_at_ms,closed_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (row["bot"], row["symbol"], row["side"], close_qty, row["entry_price"],
+                 exit_price, row["leverage"], alloc_open_fee, close_fee, gross, net,
+                 row["sl_price"], row["tp_price"], row["liq_price"], exit_reason, 0,
+                 row["paper"], row["opened_at_ms"], now))
+            conn.execute("INSERT INTO pair_outcomes (pair,win,net_usd,ts_ms) VALUES (?,?,?,?)",
+                         (row["symbol"], 1 if net > 0 else 0, net, now))
+            conn.commit()
+            return TradeRow(id=trade_id, symbol=row["symbol"], side=row["side"], qty=close_qty,
+                            entry_price=row["entry_price"], open_fee=alloc_open_fee,
+                            close_fee=close_fee, exit_price=exit_price, net_usd=net)
+
     def record_outcome(self, pair: str, win: bool, net_usd: float = 0.0) -> None:
         """Append a pair outcome directly (used by the eval store)."""
         with self._conn() as conn:
