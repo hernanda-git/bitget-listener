@@ -96,8 +96,28 @@ class Orchestrator:
             return "dead-man's switch active (feed stale)"
         if not rs.symbol_usdt:
             return "no symbol parsed"
-        if rs.chart and not bool((rs.raw or {}).get("chart_executable")):
-            return "chart has no explicit executable entry and protective SL"
+        if rs.chart:
+            chart_direction = str((rs.chart or {}).get("movement_direction") or "").upper()
+            entry = rs.entry
+            stop = rs.sl
+            explicit_levels = entry is not None and stop is not None
+            entry_value = float(entry) if entry is not None else 0.0
+            stop_value = float(stop) if stop is not None else 0.0
+            directional_levels = (
+                (rs.side == "BUY" and stop_value < entry_value)
+                or (rs.side == "SELL" and stop_value > entry_value)
+            ) if explicit_levels else False
+            chart_is_valid = bool(
+                (rs.chart or {}).get("has_chart_data")
+                and rs.symbol_usdt
+                and rs.side in ("BUY", "SELL")
+                and explicit_levels
+                and directional_levels
+                and ((rs.side == "BUY" and chart_direction == "BULLISH")
+                     or (rs.side == "SELL" and chart_direction == "BEARISH"))
+            )
+            if not chart_is_valid or not bool((rs.raw or {}).get("chart_executable")):
+                return "chart failed independent executable validation"
         # Static denylist still short-circuits instantly, but we no longer DROP
         # a tradable symbol just because it wasn't on a hand-picked list.
         if self.whitelist and rs.symbol_usdt not in self.whitelist:
