@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 
@@ -31,15 +32,18 @@ class FakeSignalSource(SignalSource):
     """Replays canned messages into the pipeline queue. Zero network."""
 
     def __init__(self, messages: list[str] | None = None,
-                 symbol_map: SymbolMap | None = None) -> None:
+                 symbol_map: SymbolMap | None = None, trace_store=None) -> None:
         self.messages = list(messages or [])
         self.symbol_map = symbol_map
+        self.trace_store = trace_store
         self.queue: asyncio.Queue = asyncio.Queue()
         self.started = False
 
     async def start(self) -> None:
         self.started = True
         for i, text in enumerate(self.messages, start=1):
+            if self.trace_store is not None:
+                self.trace_store.record_received(f"fake-{i}", i, "fake", text)
             for rs in parse_signals(text, message_id=i, symbol_map=self.symbol_map):
                 await self.queue.put(rs)
 
@@ -50,7 +54,10 @@ class FakeSignalSource(SignalSource):
         return self.queue
 
     async def push(self, text: str, message_id: int | None = None) -> list[RawSignal]:
-        sigs = parse_signals(text, message_id=message_id, symbol_map=self.symbol_map)
+        mid = message_id if message_id is not None else int(uuid.uuid4().int % 2_000_000_000)
+        if self.trace_store is not None:
+            self.trace_store.record_received(f"fake-{mid}", mid, "fake", text)
+        sigs = parse_signals(text, message_id=mid, symbol_map=self.symbol_map)
         for rs in sigs:
             await self.queue.put(rs)
         return sigs
@@ -66,12 +73,13 @@ class TelethonSource(SignalSource):
 
     def __init__(self, channel: str | None = None, session: str | None = None,
                  api_id: int | None = None, api_hash: str | None = None,
-                 symbol_map: SymbolMap | None = None) -> None:
+                 symbol_map: SymbolMap | None = None, trace_store=None) -> None:
         self.channel = channel or os.getenv("TG_CHANNEL", "fattyfatclub")
         self.session = session or os.getenv("TG_SESSION", "")
         self.api_id = api_id or int(os.getenv("TG_API_ID") or 0)
         self.api_hash = api_hash or os.getenv("TG_API_HASH", "")
         self.symbol_map = symbol_map
+        self.trace_store = trace_store
         self.queue: asyncio.Queue = asyncio.Queue()
         self._client = None
         # Optional chart plugin. It is disabled unless a compatible vision key
@@ -143,6 +151,13 @@ class TelethonSource(SignalSource):
 
         @self._client.on(events.NewMessage(chats=self.channel))
         async def _handler(event):    # pragma: no cover - requires a live session
+            if self.trace_store is not None:
+                self.trace_store.record_received(
+                    f"{self.channel}:{int(event.id)}", int(event.id), self.channel,
+                    event.raw_text or "", bool(event.media),
+                    source_timestamp=event.date.isoformat() if event.date else None,
+                    reply_to_message_id=getattr(event.message, "reply_to_msg_id", None),
+                )
             signals = await parse_with_fallback(event.raw_text, message_id=event.id,
                                     ts_ms=int(event.date.timestamp() * 1000),
                                     channel=self.channel, symbol_map=self.symbol_map,

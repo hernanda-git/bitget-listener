@@ -13,6 +13,8 @@ inherited bug fixes at the storage boundary:
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import sqlite3
 import threading
 import time
@@ -60,6 +62,39 @@ CREATE TABLE IF NOT EXISTS equity_log (
     open_pos    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_log(ts_ms);
+CREATE TABLE IF NOT EXISTS signal_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trace_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    source_timestamp TEXT,
+    received_timestamp INTEGER NOT NULL,
+    raw_text TEXT NOT NULL,
+    has_media INTEGER NOT NULL DEFAULT 0,
+    reply_to_message_id INTEGER,
+    payload_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'RECEIVED',
+    UNIQUE(channel, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_signal_receipts_trace ON signal_receipts(trace_id);
+CREATE TABLE IF NOT EXISTS trace_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trace_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trace_events_trace ON trace_events(trace_id, id);
+CREATE TABLE IF NOT EXISTS pending_setups (
+    setup_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    created_at INTEGER NOT NULL,
+    terminal_at INTEGER
+);
 """
 
 
@@ -103,6 +138,71 @@ class TradeLedger:
             self._shared = self._new_conn()
         else:
             self._new_conn().close()      # create the schema on disk once
+
+    def record_received(self, trace_id: str, message_id: int, channel: str,
+                        raw_text: str, has_media: bool = False,
+                        source_timestamp: str | None = None,
+                        reply_to_message_id: int | None = None) -> bool:
+        """Durably record Telegram intake before parsing or vision."""
+        digest = hashlib.sha256((raw_text or "").encode()).hexdigest()
+        now = int(time.time() * 1000)
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO signal_receipts
+                   (trace_id,message_id,channel,source_timestamp,received_timestamp,
+                    raw_text,has_media,reply_to_message_id,payload_hash)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (trace_id, message_id, channel, source_timestamp, now, raw_text or "",
+                 1 if has_media else 0, reply_to_message_id, digest),
+            )
+            conn.execute(
+                """INSERT INTO trace_events
+                   (trace_id,message_id,stage,status,payload_json,created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (trace_id, message_id, "RECEIVED", "DUPLICATE" if cur.rowcount == 0 else "OK",
+                 json.dumps({"has_media": bool(has_media), "payload_hash": digest}), now),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+
+    def record_stage(self, trace_id: str, message_id: int, stage: str,
+                     status: str = "OK", reason: str = "", payload: dict | None = None) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO trace_events
+                   (trace_id,message_id,stage,status,reason,payload_json,created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (trace_id, message_id, stage, status, reason or "",
+                 json.dumps(payload or {}, default=str), int(time.time() * 1000)),
+            )
+            conn.commit()
+
+    def get_trace(self, trace_id: str) -> list[dict]:
+        with self._conn() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM trace_events WHERE trace_id=? ORDER BY id", (trace_id,)).fetchall()]
+
+    def save_pending_setup(self, setup_id: str, payload: dict) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO pending_setups(setup_id,payload_json,status,created_at)
+                   VALUES (?,?, 'PENDING', ?)
+                   ON CONFLICT(setup_id) DO UPDATE SET payload_json=excluded.payload_json,
+                   status='PENDING', terminal_at=NULL""",
+                (setup_id, json.dumps(payload, default=str), int(time.time() * 1000)),
+            )
+            conn.commit()
+
+    def pending_setups(self) -> list[dict]:
+        with self._conn() as conn:
+            return [json.loads(row[0]) for row in conn.execute(
+                "SELECT payload_json FROM pending_setups WHERE status='PENDING' ORDER BY created_at").fetchall()]
+
+    def finish_pending_setup(self, setup_id: str, status: str) -> None:
+        with self._conn() as conn:
+            conn.execute("UPDATE pending_setups SET status=?, terminal_at=? WHERE setup_id=?",
+                         (status, int(time.time() * 1000), setup_id))
+            conn.commit()
 
     def _new_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, check_same_thread=False, timeout=15)

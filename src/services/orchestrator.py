@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import asdict
 import logging
 import os
 import time
@@ -57,6 +58,14 @@ class Orchestrator:
         self.rate_limit = rate_limit or RateLimitGate()
         self.pending_watcher = PendingSetupWatcher()
         self.pending_setups: dict[str, RawSignal] = {}
+        restore = getattr(self.ledger, "pending_setups", None)
+        if callable(restore):
+            for payload in restore():
+                try:
+                    setup = PendingSetup(**payload)
+                    self.pending_watcher.register(setup)
+                except Exception as exc:
+                    log.error("pending setup restore failed closed: %s", exc)
         self.private_stream = private_stream  # BitgetWS(private=True) when creds exist
         # Per-signal affordability (replaces the brittle static whitelist).
         self.tradability = tradability
@@ -66,6 +75,15 @@ class Orchestrator:
         self._task: asyncio.Task | None = None
         self._running = False
         self.report_interval_s = float(os.getenv("BITGET_REPORT_INTERVAL_S", "21600"))
+
+    def _trace(self, rs: RawSignal, stage: str, status: str = "OK",
+               reason: str = "", payload: dict | None = None) -> None:
+        store = getattr(self, "ledger", None)
+        recorder = getattr(store, "record_stage", None)
+        if callable(recorder):
+            mid = int(rs.message_id or 0)
+            recorder(f"{getattr(rs, 'channel', 'fattyfatclub')}:{mid}", mid,
+                     stage, status, reason, payload)
 
     # ------------------------------------------------------------------- guards
     def _sync_paper_flag(self) -> None:
@@ -147,6 +165,9 @@ class Orchestrator:
 
     async def handle(self, rs: RawSignal) -> dict:
         """Single entry point for one inbound message."""
+        self._trace(rs, "PARSED", "OK", payload={
+            "symbol": rs.symbol_usdt, "side": rs.side, "has_media": bool(rs.has_media),
+        })
         if rs.is_management:
             return await self.handle_management(rs)
 
@@ -159,6 +180,11 @@ class Orchestrator:
                 setup = PendingSetup(**pending_raw)
                 self.pending_watcher.register(setup)
                 self.pending_setups[setup.setup_id] = rs
+                persist = getattr(self.ledger, "save_pending_setup", None)
+                if callable(persist):
+                    persist(setup.setup_id, asdict(setup))
+                self._trace(rs, "GATE_EVALUATED", "PENDING", "PENDING_SETUP",
+                            {"setup_id": setup.setup_id, "trigger": setup.trigger_price})
                 log.info("pending setup registered: %s %s %s", setup.symbol,
                          setup.condition, setup.trigger_price)
                 if self.notifier is not None:
@@ -188,6 +214,7 @@ class Orchestrator:
 
         reason = await self.guard(rs)
         if reason is not None:
+            self._trace(rs, "GATE_EVALUATED", "REJECTED", reason)
             self.skipped.append({"symbol": rs.symbol_usdt, "reason": reason})
             log.info("skipping signal: %s", reason)
             if self.notifier is not None:
@@ -216,6 +243,9 @@ class Orchestrator:
         self._sync_paper_flag()
         multiplier = self.shadow.size_multiplier(signal.instrument.symbol)
         result = await self.orders.open_from_signal(signal, size_multiplier=multiplier)
+        self._trace(rs, "ORDER_SUBMITTED" if result.get("status") in ("PLACED", "PAPER") else "ORDER_FAILED",
+                    "OK" if result.get("status") in ("PLACED", "PAPER") else "REJECTED",
+                    result.get("reason", ""), {"status": result.get("status"), "order_id": result.get("order_id")})
         await self._after_open(signal, result)
         return result
 
@@ -485,6 +515,10 @@ class Orchestrator:
         for obs in self.pending_watcher.observe(symbol, mark):
             log.info("pending setup %s %s mark=%s confirmations=%s reason=%s",
                      obs.status, obs.symbol, obs.mark_price, obs.confirmations, obs.reason)
+            if obs.status in ("CONFIRMED", "INVALIDATED"):
+                finish = getattr(self.ledger, "finish_pending_setup", None)
+                if callable(finish):
+                    finish(obs.setup_id, obs.status)
             if self.notifier is not None and obs.status in ("CONFIRMED", "INVALIDATED"):
                 with contextlib.suppress(Exception):
                     await self.notifier.send(

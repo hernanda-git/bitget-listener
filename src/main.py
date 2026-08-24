@@ -117,9 +117,9 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
             auth=BitgetAuth(_bk, _bs, _bp), private=True, rate_limit=rate_limit)
 
     if use_fake_source:
-        source = FakeSignalSource([], symbol_map=symbol_map)
+        source = FakeSignalSource([], symbol_map=symbol_map, trace_store=ledger)
     else:
-        source = TelethonSource(symbol_map=symbol_map)
+        source = TelethonSource(symbol_map=symbol_map, trace_store=ledger)
 
     stream = BitgetWS(symbols=sorted(whitelist), product_type=product_type,
                      rate_limit=rate_limit)
