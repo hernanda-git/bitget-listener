@@ -43,8 +43,8 @@ class FakeSignalSource(SignalSource):
         self.started = True
         for i, text in enumerate(self.messages, start=1):
             if self.trace_store is not None:
-                self.trace_store.record_received(f"fake-{i}", i, "fake", text)
-            for rs in parse_signals(text, message_id=i, symbol_map=self.symbol_map):
+                self.trace_store.record_received(f"fake:{i}", i, "fake", text)
+            for rs in parse_signals(text, message_id=i, channel="fake", symbol_map=self.symbol_map):
                 await self.queue.put(rs)
 
     async def stop(self) -> None:
@@ -56,8 +56,8 @@ class FakeSignalSource(SignalSource):
     async def push(self, text: str, message_id: int | None = None) -> list[RawSignal]:
         mid = message_id if message_id is not None else int(uuid.uuid4().int % 2_000_000_000)
         if self.trace_store is not None:
-            self.trace_store.record_received(f"fake-{mid}", mid, "fake", text)
-        sigs = parse_signals(text, message_id=mid, symbol_map=self.symbol_map)
+            self.trace_store.record_received(f"fake:{mid}", mid, "fake", text)
+        sigs = parse_signals(text, message_id=mid, channel="fake", symbol_map=self.symbol_map)
         for rs in sigs:
             await self.queue.put(rs)
         return sigs

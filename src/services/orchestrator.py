@@ -82,8 +82,8 @@ class Orchestrator:
         recorder = getattr(store, "record_stage", None)
         if callable(recorder):
             mid = int(rs.message_id or 0)
-            recorder(f"{getattr(rs, 'channel', 'fattyfatclub')}:{mid}", mid,
-                     stage, status, reason, payload)
+            channel = getattr(rs, "channel", "") or getattr(rs, "source", "fattyfatclub")
+            recorder(f"{channel}:{mid}", mid, stage, status, reason, payload)
 
     # ------------------------------------------------------------------- guards
     def _sync_paper_flag(self) -> None:
@@ -94,6 +94,14 @@ class Orchestrator:
         """Returns a rejection reason, or None when the signal may proceed."""
         if self.deadman is not None and not self.deadman.trading_allowed:
             return "dead-man's switch active (feed stale)"
+        evidence = set((rs.raw or {}).get("direction_evidence", []))
+        if bool((rs.raw or {}).get("direction_conflict")) or len(evidence) > 1:
+            return "DIRECTION_CONFLICT"
+        raw_direction = str((rs.raw or {}).get("raw_direction") or "").upper()
+        model_direction = str((rs.raw or {}).get("model_direction") or "").upper()
+        if raw_direction in {"BUY", "SELL"} and model_direction in {"BUY", "SELL"} \
+                and raw_direction != model_direction:
+            return "DIRECTION_CONFLICT"
         if not rs.symbol_usdt:
             return "no symbol parsed"
         if rs.chart:
@@ -189,7 +197,10 @@ class Orchestrator:
             "symbol": rs.symbol_usdt, "side": rs.side, "has_media": bool(rs.has_media),
         })
         if rs.is_management:
-            return await self.handle_management(rs)
+            result = await self.handle_management(rs)
+            self._trace(rs, "MANAGEMENT", result.get("status", "UNKNOWN"),
+                        result.get("reason", ""), result)
+            return result
 
         # Conditional chart setups are monitoring-only at this stage. They are
         # registered with the shared tick watcher and never bypass the normal
@@ -235,6 +246,7 @@ class Orchestrator:
         reason = await self.guard(rs)
         if reason is not None:
             self._trace(rs, "GATE_EVALUATED", "REJECTED", reason)
+            self._trace(rs, "TERMINAL", "REJECTED", reason)
             self.skipped.append({"symbol": rs.symbol_usdt, "reason": reason})
             log.info("skipping signal: %s", reason)
             if self.notifier is not None:
@@ -246,6 +258,7 @@ class Orchestrator:
         signal = self.to_signal(rs)
         if signal is None:
             reason = "unparseable signal"
+            self._trace(rs, "TERMINAL", "REJECTED", reason)
             self.skipped.append({"symbol": rs.symbol_usdt, "reason": reason})
             if self.notifier is not None:
                 with contextlib.suppress(Exception):
@@ -459,18 +472,27 @@ class Orchestrator:
             log.error("cannot book close for %s: no open trade in ledger — "
                       "leaving position as-is (exchange already closed it)", symbol)
             return
-        mark = None
-        if self.stream is not None:
-            mark = self.stream.mark_price(symbol)
-        if mark is None:
-            with contextlib.suppress(Exception):
-                mark = await self.adapter.get_mark_price(Instrument.from_token(symbol))
-        if mark is None:
-            log.error("cannot book close for %s without a price — leaving trade open", symbol)
+        if res.get("status") == "PAPER":
+            mark = self.stream.mark_price(symbol) if self.stream is not None else None
+            if mark is None:
+                with contextlib.suppress(Exception):
+                    mark = await self.adapter.get_mark_price(Instrument.from_token(symbol))
+            if mark is None or float(mark) <= 0:
+                log.error("cannot book paper close for %s without a mark", symbol)
+                return
+            res = {**res, "close_fill_price": float(mark)}
+        elif not res.get("exchange_confirmed"):
+            log.error("cannot book close for %s without exchange confirmation — leaving trade open", symbol)
             return
+        mark = res.get("close_fill_price")
+        if mark is None or float(mark) <= 0:
+            log.error("cannot book close for %s without authoritative fill price — leaving trade open", symbol)
+            return
+        close_fee = res.get("close_fill_fee")
+        if close_fee is None:
+            close_fee = self.sizer.estimate_close_fee(self.ledger.get(tid)["qty"], mark, None)
         row = self.ledger.record_close(
-            tid, exit_price=mark, close_fee=self.sizer.estimate_close_fee(
-                self.ledger.get(tid)["qty"], mark, None),
+            tid, exit_price=mark, close_fee=close_fee,
             exit_reason=res.get("reason") or res.get("action", "close"))
         self.daily_realized += (row.net_usd or 0.0)
         self.shadow.record(symbol, (row.net_usd or 0.0) > 0, row.net_usd or 0.0)

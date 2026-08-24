@@ -85,8 +85,12 @@ class OrderService:
             instrument=signal.instrument, side=signal.side, order_type="market",
             qty=BitgetAdapter.round_qty(spec, qty, entry), price=None,
             sl=signal.sl, tp=signal.tp, leverage=sized.leverage,
+            margin_mode="crossed",
             client_order_id=client_oid, decision_id=decision_id,
         )
+        if signal.raw.get("entry_order_type") == "LIMIT":
+            order.order_type = "limit"
+            order.price = entry
 
         verdict = validate_order(order, spec, price_ref=entry)
         if not verdict:
@@ -199,11 +203,49 @@ class OrderService:
             instrument=real_pos.instrument, side=real_pos.side.opposite,
             order_type="market", qty=BitgetAdapter.round_qty(spec, qty, real_pos.entry_price),
             reduce_only=True, leverage=real_pos.leverage,
-            margin_mode=real_pos.margin_mode,
+            margin_mode="crossed",
             client_order_id=BitgetAdapter.new_client_oid("bgc"),
         )
         if self.paper:
             return {"status": "PAPER", "order": order, "reason": reason}
         order_id = await self.adapter.place_order(order)
+        fills = await self._resolve_close_fill(order, order_id)
+        try:
+            venue_positions = await self.adapter.get_positions()
+        except Exception as exc:
+            log.warning("close position read-back failed for %s/%s: %s",
+                        order.instrument.symbol, order_id, exc)
+            venue_positions = None
+        if venue_positions is None:
+            return {"status": "UNKNOWN", "order_id": order_id, "order": order,
+                    "reason": "position read-back unavailable", "exchange_confirmed": False}
+        remaining = next((p.size for p in venue_positions
+                          if p.instrument.symbol == order.instrument.symbol), 0.0)
+        if not fills:
+            return {"status": "UNKNOWN", "order_id": order_id, "order": order,
+                    "reason": "close read-back unavailable", "exchange_confirmed": False}
+        total_qty = sum(float(getattr(f, "qty", 0) or 0) for f in fills)
+        if total_qty <= 0:
+            return {"status": "UNKNOWN", "order_id": order_id, "order": order,
+                    "reason": "close fill has no quantity", "exchange_confirmed": False}
+        fill_price = sum(float(f.price) * float(f.qty) for f in fills) / total_qty
+        fill_fee = sum(float(getattr(f, "fee", 0) or 0) for f in fills)
         return {"status": "PLACED", "order_id": order_id, "order": order,
-                "reason": reason, "closed_qty": qty, "real_size": real_size}
+                "reason": reason, "closed_qty": qty, "real_size": real_size,
+                "close_fill_price": fill_price, "close_fill_fee": fill_fee,
+                "exchange_position_size": remaining, "exchange_flat": remaining <= 1e-12,
+                "exchange_confirmed": True}
+
+    async def _resolve_close_fill(self, order: OrderRequest, order_id: str):
+        get_fills = getattr(self.adapter, "get_fills", None)
+        if get_fills is None:
+            return []
+        try:
+            fills = await get_fills(order.instrument)
+            return [f for f in (fills or [])
+                    if str(getattr(f, "order_id", "")) == str(order_id)
+                    or str(getattr(f, "client_order_id", "")) == str(order.client_order_id)]
+        except Exception as exc:
+            log.warning("close fill read-back failed for %s/%s: %s",
+                        order.instrument.symbol, order_id, exc)
+            return []

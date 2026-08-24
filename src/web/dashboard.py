@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +125,15 @@ def create_app(orchestrator, password: str | None = None) -> FastAPI:
             "server_time": jakarta(int(datetime.now(timezone.utc).timestamp() * 1000)),
         })
 
+    @app.get("/api/trace/{trace_id:path}")
+    async def trace(trace_id: str):
+        """Read-only ordered cross-stage trace for operator/audit tooling."""
+        getter = getattr(orchestrator.ledger, "get_trace", None)
+        if not callable(getter):
+            return JSONResponse({"trace_id": trace_id, "stages": []})
+        stages = getter(trace_id)
+        return JSONResponse({"trace_id": trace_id, "stages": stages})
+
     @app.get("/", response_class=HTMLResponse)
     async def index():
         return HTMLResponse(INDEX_HTML)
@@ -134,7 +144,7 @@ def create_app(orchestrator, password: str | None = None) -> FastAPI:
         require_auth(x_dash_password, f"close {payload.get('symbol')}")
         res = await orchestrator.positions.full_close(
             str(payload.get("symbol", "")).upper(), reason="dashboard")
-        return JSONResponse(res)
+        return JSONResponse(jsonable_encoder(res))
 
     @app.post("/api/paper")
     async def to_paper(x_dash_password: str | None = Header(None)):
@@ -550,7 +560,7 @@ function esc(s){s=String(s==null?'':s);return s.replace(/[&<>"]/g,function(c){re
 function num(v){const n=Number(v);return (v===null||v===undefined||v===''||isNaN(n))?null:n;}
 function fmt(n){n=num(n);if(n===null)return '—';const a=Math.abs(n);if(a>=1)return n.toLocaleString(undefined,{maximumFractionDigits:2});return n.toFixed(4);}
 function fmtSigned(n){n=num(n);if(n===null)return '—';return (n>=0?'+':'')+fmt(n);}
-function logTime(ts){const d=ts?new Date(ts*1000):new Date();return d.toLocaleTimeString([],{hour12:false});}
+function logTime(ts){const d=ts?new Date(ts*1000):new Date();return d.toLocaleTimeString('en-GB',{timeZone:'Asia/Jakarta',hour12:false});}
 function clsOf(v){const n=num(v);if(n===null)return '';if(n>0)return 'pos';if(n<0)return 'neg';return '';}
 function setConn(live){const dot=document.querySelector('#conn .dot');const txt=$('connText');if(live){dot.className='dot live';txt.textContent='live';}else{dot.className='dot';txt.textContent='reconnecting…';}}
 

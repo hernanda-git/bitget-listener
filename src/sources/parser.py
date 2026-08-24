@@ -140,6 +140,37 @@ def _side(text: str) -> str | None:
     return None
 
 
+def _direction_evidence(text: str) -> set[str]:
+    low = text.lower()
+    out: set[str] = set()
+    if any(re.search(rf"\b{k}\b", low) for k in _LONG):
+        out.add("BUY")
+    if any(re.search(rf"\b{k}\b", low) for k in _SHORT):
+        out.add("SELL")
+    return out
+
+
+def _conditional(text: str, symbol: str | None, nums: dict[str, float]) -> tuple[str, float] | None:
+    """Classify conditional prose before any model or order path can run."""
+    if not symbol:
+        return None
+    low = text.lower()
+    trigger = nums.get("entry")
+    if trigger is None:
+        m = re.search(r"(?:hold\s+(?:above|below)|(?:pullback|retrace)|buy\s+the\s+dip|"
+                      r"breakout\s+(?:above|below))\D{0,20}(\d+(?:\.\d+)?)", low)
+        trigger = float(m.group(1)) if m else None
+    if trigger is None:
+        return None
+    if re.search(r"\bhold\s+above\b|\bbreakout\s+above\b", low):
+        return "hold_above", trigger
+    if re.search(r"\bhold\s+below\b|\bbreakout\s+below\b", low):
+        return "hold_below", trigger
+    if re.search(r"\bpullback\b|\bretrace\b|\bbuy\s+the\s+dip\b", low):
+        return "limit_entry", trigger
+    return None
+
+
 def _management_action(text: str) -> tuple[str, dict] | None:
     low = text.lower()
     # 1) Numeric modifies — only when an actual price follows (tp 0.5 / sl 61250 /
@@ -229,6 +260,7 @@ def parse_signals(text: str, message_id: int | None = None, ts_ms: int | None = 
         side = _side(clause)
         chosen_side: Literal["BUY", "SELL"] = side or "BUY"  # type: ignore[assignment]
         nums = _extract_num_map(clause)
+        evidence = _direction_evidence(clause)
 
         mgmt = _management_action(clause)
         is_entry = side is not None and nums.get("entry") is not None
@@ -247,7 +279,8 @@ def parse_signals(text: str, message_id: int | None = None, ts_ms: int | None = 
             notional_usd=nums.get("size", 0.0) or nums.get("risk", 0.0),
             leverage=int(nums.get("leverage", 1) or 1),
             confidence=min(1.0, max(0.0, nums.get("confidence", 0.0))),
-            raw=raw,
+            raw={**raw, "direction_evidence": sorted(evidence),
+                 "direction_conflict": len(evidence) > 1},
             source=source,
             message_id=message_id,
             ts_ms=ts_ms,
@@ -256,9 +289,27 @@ def parse_signals(text: str, message_id: int | None = None, ts_ms: int | None = 
             is_management=mgmt is not None,
             management_action=mgmt[0] if mgmt else None,
         )
+        conditional = None if is_entry else _conditional(clause, sym, nums)
+        if conditional:
+            kind, trigger = conditional
+            if kind == "limit_entry":
+                rs.entry = trigger
+                rs.raw["conditional_entry"] = True
+                rs.raw["entry_order_type"] = "LIMIT"
+            else:
+                inferred = side or ("BUY" if kind == "hold_above" else "SELL")
+                rs.side = inferred  # type: ignore[assignment]
+                rs.raw["pending_setup"] = {
+                    "setup_id": f"{channel or source}:{message_id or 0}",
+                    "symbol": inst.symbol,
+                    "direction": "LONG" if inferred == "BUY" else "SHORT",
+                    "trigger_price": trigger,
+                    "condition": kind,
+                    "raw_text": clause,
+                }
         if mgmt:
-            raw["mgmt_price"] = mgmt[1].get("price")
-            raw["mgmt_symbol"] = inst.symbol or None
+            rs.raw["mgmt_price"] = mgmt[1].get("price")
+            rs.raw["mgmt_symbol"] = inst.symbol or None
         results.append(rs)
     return results
 

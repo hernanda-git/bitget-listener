@@ -203,6 +203,9 @@ class PositionManager:
         if pos is None:
             return {"status": "NO_POSITION", "symbol": symbol}
         res = await self.orders.close_position(pos, fraction, reason="tp1_booked")
+        if res.get("status") == "UNKNOWN":
+            return {"status": "UNKNOWN", "action": "partial",
+                    "reason": res.get("reason", "exchange close unverified")}
         real_size = res.get("real_size")
         # Prefer the exchange-confirmed size; fall back to the cache snapshot.
         base = real_size if real_size is not None else pos.size
@@ -211,20 +214,23 @@ class PositionManager:
             self.upsert(Position(**{**pos.__dict__, "size": remaining}))
         else:
             self.positions.pop(pos.instrument.symbol, None)
-        return {"status": res.get("status"), "action": "partial", "closed_fraction": fraction,
-                "remaining": remaining}
+        return {**res, "status": res.get("status"), "action": "partial",
+                "closed_fraction": fraction, "remaining": remaining}
 
     async def full_close(self, symbol: str, reason: str = "full") -> dict:
         pos = self.get(symbol)
         if pos is None:
             return {"status": "NO_POSITION", "symbol": symbol}
         res = await self.orders.close_position(pos, 1.0, reason=reason)
+        if res.get("status") == "UNKNOWN":
+            return {"status": "UNKNOWN", "action": "full_close",
+                    "reason": res.get("reason", "exchange close unverified")}
         self.positions.pop(pos.instrument.symbol, None)
         # Drop the persisted bot-side stop: the position is gone, don't re-arm it.
         if symbol.upper() in self._armed:
             self._armed.pop(symbol.upper(), None)
             self._armed_store.remove(symbol)
-        return {"status": res.get("status"), "action": "full_close"}
+        return {**res, "status": res.get("status"), "action": "full_close"}
 
     async def modify_stop(self, symbol: str, sl: float | None = None,
                           tp: float | None = None) -> dict:

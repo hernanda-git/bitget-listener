@@ -12,6 +12,7 @@ BUG A / BUG B invariants from the original ledger are preserved:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from bot_common import repos
@@ -42,6 +43,29 @@ class PostgresLedger:
 
     def __init__(self, bot: str = BOT) -> None:
         self.bot = bot
+
+    # --------------------------------------------------------------- trace spine
+    def record_received(self, trace_id: str, message_id: int, channel: str,
+                        raw_text: str, has_media: bool = False,
+                        source_timestamp: str | None = None,
+                        reply_to_message_id: int | None = None) -> bool:
+        return repos.Traces.record_received(
+            self.bot, trace_id, message_id, channel, raw_text=raw_text,
+            has_media=has_media, source_timestamp=source_timestamp,
+            reply_context={"reply_to_message_id": reply_to_message_id}
+            if reply_to_message_id is not None else {},
+            service_identity=os.getenv("BOT_NAME", self.bot),
+            source_process="bitget-listener")
+
+    def record_stage(self, trace_id: str, message_id: int, stage: str,
+                     status: str = "OK", reason: str = "",
+                     payload: dict | None = None) -> None:
+        repos.Traces.record_stage(self.bot, trace_id, message_id, stage, status,
+                                  reason, payload=payload,
+                                  service_identity=os.getenv("BOT_NAME", self.bot))
+
+    def get_trace(self, trace_id: str) -> list[dict]:
+        return repos.Traces.get_trace(self.bot, trace_id)
 
     # ------------------------------------------------------------------ writing
     def record_open(self, symbol: str, side: str, qty: float, entry_price: float,
