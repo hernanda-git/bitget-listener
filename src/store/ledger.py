@@ -15,6 +15,8 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
+import socket
 import sqlite3
 import threading
 import time
@@ -73,6 +75,10 @@ CREATE TABLE IF NOT EXISTS signal_receipts (
     has_media INTEGER NOT NULL DEFAULT 0,
     reply_to_message_id INTEGER,
     payload_hash TEXT NOT NULL,
+    source_process TEXT NOT NULL DEFAULT '',
+    source_host TEXT NOT NULL DEFAULT '',
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'RECEIVED',
     UNIQUE(channel, message_id)
 );
@@ -146,21 +152,30 @@ class TradeLedger:
         """Durably record Telegram intake before parsing or vision."""
         digest = hashlib.sha256((raw_text or "").encode()).hexdigest()
         now = int(time.time() * 1000)
+        process = f"python:{os.getpid()}"
+        host = socket.gethostname()
         with self._conn() as conn:
             cur = conn.execute(
                 """INSERT OR IGNORE INTO signal_receipts
                    (trace_id,message_id,channel,source_timestamp,received_timestamp,
-                    raw_text,has_media,reply_to_message_id,payload_hash)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                    raw_text,has_media,reply_to_message_id,payload_hash,
+                    source_process,source_host,schema_version,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (trace_id, message_id, channel, source_timestamp, now, raw_text or "",
-                 1 if has_media else 0, reply_to_message_id, digest),
+                 1 if has_media else 0, reply_to_message_id, digest,
+                 process, host, 1, now),
             )
             conn.execute(
                 """INSERT INTO trace_events
                    (trace_id,message_id,stage,status,payload_json,created_at)
                    VALUES (?,?,?,?,?,?)""",
                 (trace_id, message_id, "RECEIVED", "DUPLICATE" if cur.rowcount == 0 else "OK",
-                 json.dumps({"has_media": bool(has_media), "payload_hash": digest}), now),
+                 json.dumps({"has_media": bool(has_media), "payload_hash": digest,
+                            "raw_text": raw_text or "", "channel": channel,
+                            "source_timestamp": source_timestamp,
+                            "reply_to_message_id": reply_to_message_id,
+                            "source_process": process, "source_host": host,
+                            "schema_version": 1}), now),
             )
             conn.commit()
             return cur.rowcount == 1
@@ -179,8 +194,14 @@ class TradeLedger:
 
     def get_trace(self, trace_id: str) -> list[dict]:
         with self._conn() as conn:
-            return [dict(row) for row in conn.execute(
+            events = [dict(row) for row in conn.execute(
                 "SELECT * FROM trace_events WHERE trace_id=? ORDER BY id", (trace_id,)).fetchall()]
+            receipt = conn.execute(
+                "SELECT * FROM signal_receipts WHERE trace_id=? ORDER BY id LIMIT 1",
+                (trace_id,)).fetchone()
+            if events and receipt is not None:
+                events[0]["receipt"] = dict(receipt)
+            return events
 
     def save_pending_setup(self, setup_id: str, payload: dict) -> None:
         with self._conn() as conn:
@@ -208,6 +229,15 @@ class TradeLedger:
         conn = sqlite3.connect(self.path, check_same_thread=False, timeout=15)
         conn.row_factory = sqlite3.Row
         conn.executescript(DDL)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(signal_receipts)")}
+        for name, definition in {
+            "source_process": "TEXT NOT NULL DEFAULT ''",
+            "source_host": "TEXT NOT NULL DEFAULT ''",
+            "schema_version": "INTEGER NOT NULL DEFAULT 1",
+            "created_at": "INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE signal_receipts ADD COLUMN {name} {definition}")
         conn.commit()
         return conn
 

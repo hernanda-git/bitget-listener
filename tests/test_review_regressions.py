@@ -42,6 +42,8 @@ async def test_catchup_records_receipt_before_parsing():
     await src._catch_up(limit=1)
     events = led.get_trace("fattyfatclub:101")
     assert events and events[0]["stage"] == "RECEIVED"
+    assert events[0]["receipt"]["raw_text"] == "$BTC tp1 booked"
+    assert any(event["stage"] == "PARSER" for event in events)
 
 
 def test_llm_entry_without_direction_fails_closed():

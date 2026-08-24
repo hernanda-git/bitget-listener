@@ -91,7 +91,8 @@ class SignalLLM:
 
     def _to_rawsignal(self, obj: dict, message_id, ts_ms, source, channel,
                       symbol_map: SymbolMap | None,
-                      raw_direction: str | None = None) -> RawSignal | None:
+                      raw_direction: str | None = None,
+                      raw_text: str = "") -> RawSignal | None:
         sym_raw = str(obj.get("symbol") or "").strip().lstrip("$#").upper()
         if not sym_raw:
             return None
@@ -126,7 +127,7 @@ class SignalLLM:
             side=model_direction,
             entry=entry, sl=sl, tp=tp, notional_usd=0.0, leverage=1,
             confidence=0.0, raw={
-                "text": "", "llm": True,
+                "text": raw_text, "llm": True,
                 "model_direction": model_direction if action == "entry" else "",
                 "raw_direction": raw_direction or "",
                 "direction_conflict": bool(
@@ -135,13 +136,14 @@ class SignalLLM:
                 ),
             },
             source=source, message_id=message_id, ts_ms=ts_ms,
-            channel=channel, raw_text="", is_management=mgmt is not None,
+            channel=channel, raw_text=raw_text, is_management=mgmt is not None,
             management_action=mgmt,
         )
 
     async def parse(self, text: str, message_id=None, ts_ms=None, source="fattyfatclub",
-                    channel="", symbol_map: SymbolMap | None = None,
-                    raw_direction: str | None = None) -> RawSignal | None:
+                            channel="", symbol_map: SymbolMap | None = None,
+                    raw_direction: str | None = None,
+                    raw_text: str = "") -> RawSignal | None:
         if not self.enabled:
             return None
         try:
@@ -169,7 +171,7 @@ class SignalLLM:
             log.warning("[llm-fallback] no JSON in response — using deterministic")
             return None
         rs = self._to_rawsignal(obj, message_id, ts_ms, source, channel, symbol_map,
-                                raw_direction=raw_direction)
+                                raw_direction=raw_direction, raw_text=raw_text)
         if rs is None:
             return None
         log.info("[llm-fallback] recovered signal for %s action=%s", rs.symbol_usdt,
@@ -204,7 +206,7 @@ async def parse_with_fallback(text: str, message_id=None, ts_ms=None,
     raw_direction = next(iter(raw_directions)) if len(raw_directions) == 1 else None
     rs = await llm.parse(text, message_id=message_id, ts_ms=ts_ms, source=source,
                          channel=channel, symbol_map=symbol_map,
-                         raw_direction=raw_direction)
+                         raw_direction=raw_direction, raw_text=text)
     if rs is None:
         return deterministic
     return [rs]

@@ -7,6 +7,7 @@ the dependency or a live session file.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import uuid
@@ -47,6 +48,11 @@ class FakeSignalSource(SignalSource):
                     self.trace_store.record_received, f"fake:{i}", i, "fake", text)
             for rs in parse_signals(text, message_id=i, channel="fake", symbol_map=self.symbol_map):
                 await self.queue.put(rs)
+            if self.trace_store is not None:
+                await asyncio.to_thread(
+                    self.trace_store.record_stage, f"fake:{i}", i, "PARSER", "OK", "",
+                    {"signals": [asdict(rs) for rs in parse_signals(
+                        text, message_id=i, channel="fake", symbol_map=self.symbol_map)]})
 
     async def stop(self) -> None:
         self.started = False
@@ -60,6 +66,10 @@ class FakeSignalSource(SignalSource):
             await asyncio.to_thread(
                 self.trace_store.record_received, f"fake:{mid}", mid, "fake", text)
         sigs = parse_signals(text, message_id=mid, channel="fake", symbol_map=self.symbol_map)
+        if self.trace_store is not None:
+            await asyncio.to_thread(
+                self.trace_store.record_stage, f"fake:{mid}", mid, "PARSER", "OK", "",
+                {"signals": [asdict(rs) for rs in sigs]})
         for rs in sigs:
             await self.queue.put(rs)
         return sigs
@@ -94,6 +104,14 @@ class TelethonSource(SignalSource):
         # only ever runs for messages the deterministic parser cannot classify.
         self.llm = SignalLLM()
 
+    async def _trace_stage(self, message_id: int, stage: str, status: str = "OK",
+                           reason: str = "", payload: dict | None = None) -> None:
+        if self.trace_store is not None:
+            await asyncio.to_thread(
+                self.trace_store.record_stage,
+                f"{self.channel}:{int(message_id)}", int(message_id), stage,
+                status, reason, payload or {})
+
     def _require_creds(self) -> None:
         missing = [n for n, v in (("TG_API_ID", self.api_id),
                                   ("TG_API_HASH", self.api_hash),
@@ -112,6 +130,9 @@ class TelethonSource(SignalSource):
             downloaded = await self._client.download_media(message, file=str(path))
             if not downloaded:
                 return signals
+            media_path = Path(str(downloaded))
+            media_bytes = media_path.read_bytes()
+            media_sha256 = hashlib.sha256(media_bytes).hexdigest()
             chart = await self.chart_vision.extract(downloaded, caption)
             fields = chart_trade_fields(chart, caption)
             suggestion = derive_protection_suggestion(chart, caption)
@@ -136,6 +157,10 @@ class TelethonSource(SignalSource):
                 rs.movement_direction = fields["movement_direction"]
                 rs.movement_waypoints = fields["movement_waypoints"]
                 rs.image_path = str(downloaded)
+                rs.raw["media_path"] = str(downloaded)
+                rs.raw["media_bytes"] = len(media_bytes)
+                rs.raw["media_sha256"] = media_sha256
+                rs.raw["vision_provider"] = type(self.chart_vision).__name__
                 rs.raw["chart_executable"] = fields["executable"]
                 rs.raw["protection_suggestion"] = suggestion
                 rs.raw["pending_setup"] = asdict(pending) if pending is not None else None
@@ -164,7 +189,16 @@ class TelethonSource(SignalSource):
                                     ts_ms=int(event.date.timestamp() * 1000),
                                     channel=self.channel, symbol_map=self.symbol_map,
                                     llm=self.llm)
+            await self._trace_stage(event.id, "PARSER", "OK", "", {
+                "signals": [asdict(rs) for rs in signals],
+                "llm_used": any((rs.raw or {}).get("llm") for rs in signals),
+            })
             signals = await self._enrich_with_chart(event.message, signals, event.raw_text)
+            await self._trace_stage(event.id, "VISION",
+                                    "OK" if self.chart_vision is not None else "DISABLED", "",
+                                    {"enabled": self.chart_vision is not None,
+                                     "has_media": bool(event.media),
+                                     "signals": [asdict(rs) for rs in signals]})
             for rs in signals:
                 rs.has_media = bool(event.media)
                 await self.queue.put(rs)
@@ -209,6 +243,11 @@ class TelethonSource(SignalSource):
                                         ts_ms=int(msg.date.timestamp() * 1000) if msg.date else None,
                                         channel=self.channel, symbol_map=self.symbol_map,
                                         llm=self.llm):
+                    await self._trace_stage(msg.id, "PARSER", "OK", "", {
+                        "signal": asdict(rs),
+                        "llm_used": bool((rs.raw or {}).get("llm")),
+                        "historical": True,
+                    })
                     # Catch-up exists to recover MISSED MANAGEMENT calls (sl/close/tp)
                     # posted while the bot was down. Replaying old ENTRY signals would
                     # open stale positions, so only management is processed here.

@@ -205,6 +205,7 @@ class Orchestrator:
     async def handle(self, rs: RawSignal) -> dict:
         """Single entry point for one inbound message."""
         await self._trace(rs, "PARSED", "OK", payload={
+            "raw_signal": asdict(rs), "raw_text": rs.raw_text,
             "symbol": rs.symbol_usdt, "side": rs.side, "has_media": bool(rs.has_media),
         })
         if rs.is_management:
@@ -297,6 +298,12 @@ class Orchestrator:
                         TelegramNotifier.format_skipped(reason, rs=rs))
             return {"status": "SKIPPED", "reason": reason}
 
+        await self._trace(rs, "DECISION", "ACCEPTED", payload={
+            "signal": asdict(signal), "raw_text": rs.raw_text,
+            "direction_evidence": (rs.raw or {}).get("direction_evidence", []),
+            "model_direction": (rs.raw or {}).get("model_direction", ""),
+        })
+
         # Realtime push: a valid signal was accepted and is about to be traded.
         # (Rejections already push "REJECTED <SYM>: <reason>" in _after_open.)
         if self.notifier is not None:
@@ -309,8 +316,27 @@ class Orchestrator:
         result = await self.orders.open_from_signal(signal, size_multiplier=multiplier)
         await self._trace(rs, "ORDER_SUBMITTED" if result.get("status") in ("PLACED", "PAPER") else "ORDER_FAILED",
                           "OK" if result.get("status") in ("PLACED", "PAPER") else "REJECTED",
-                          result.get("reason", ""), {"status": result.get("status"), "order_id": result.get("order_id")})
+                          result.get("reason", ""), {
+                              "status": result.get("status"),
+                              "order_id": result.get("order_id"),
+                              "client_order_id": result.get("client_order_id"),
+                              "order": asdict(result["order"]) if result.get("order") is not None else None,
+                              "sizing": asdict(result["sizing"]) if result.get("sizing") is not None else None,
+                              "fill": asdict(result["fill"]) if result.get("fill") is not None else None,
+                              "fill_price": result.get("fill_price"),
+                              "fill_fee": result.get("fill_fee"),
+                          })
         await self._after_open(signal, result)
+        await self._trace(rs, "BOOKKEEPING",
+                          "DEGRADED" if result.get("protection_pending") else "OK",
+                          result.get("protection_error", ""), {
+                              "status": result.get("status"),
+                              "trade_id": self.open_trade_ids.get(signal.instrument.symbol),
+                              "protection_pending": bool(result.get("protection_pending")),
+                              "protection": result.get("protection"),
+                              "position": asdict(self.positions.get(signal.instrument.symbol))
+                              if self.positions.get(signal.instrument.symbol) is not None else None,
+                          })
         return result
 
     async def _after_open(self, signal: Signal, result: dict) -> None:
@@ -392,6 +418,7 @@ class Orchestrator:
             if pos is not None and (order.sl is not None or order.tp is not None):
                 try:
                     plan = await self.orders.attach_protective(pos, order.sl, order.tp)
+                    result["protection"] = plan
                     if self.notifier is not None:
                         with contextlib.suppress(Exception):
                             await self.notifier.send(
@@ -408,6 +435,7 @@ class Orchestrator:
                               "safety net, and it dies with this process)", exc,
                               order.instrument.symbol)
                     result["protection_pending"] = True
+                    result["protection_error"] = str(exc)
                     if self.notifier is not None:
                         with contextlib.suppress(Exception):
                             await self.notifier.send(
@@ -547,6 +575,9 @@ class Orchestrator:
             return False
         self.daily_realized += (row.net_usd or 0.0)
         self.shadow.record(symbol, (row.net_usd or 0.0) > 0, row.net_usd or 0.0)
+        res["evaluation"] = asdict(self.shadow.rating(symbol))
+        res["ledger"] = {"qty": row.qty, "exit_price": row.exit_price,
+                         "close_fee": row.close_fee, "net_usd": row.net_usd}
         if not (res.get("action") == "partial" and not res.get("exchange_flat")):
             self.open_trade_ids.pop(symbol, None)
         self.gate.observe_expectancy(self.shadow)
@@ -577,6 +608,11 @@ class Orchestrator:
     async def on_fill(self, fill) -> None:
         self.gate.observe_fill(fill)
         self.positions.assert_fee_recorded(fill)
+        recorder = getattr(self.ledger, "record_stage", None)
+        if callable(recorder):
+            await asyncio.to_thread(
+                recorder, f"order:{fill.client_order_id}", 0, "FILL_OBSERVED", "OK", "",
+                {"fill": asdict(fill)})
 
     def on_position(self, position) -> None:
         self.gate.observe_position(position)
@@ -602,6 +638,16 @@ class Orchestrator:
                          position.instrument.symbol, position.sl_price, position.tp_price)
         self.positions.upsert(position)
         self._track_position_symbols()
+        recorder = getattr(self.ledger, "record_stage", None)
+        if callable(recorder):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                loop.create_task(asyncio.to_thread(
+                    recorder, f"position:{position.instrument.symbol}", 0,
+                    "POSITION_OBSERVED", "OK", "", {"position": asdict(position)}))
 
     async def on_tick(self, symbol: str, mark: float) -> None:
         # Pending setups are observed from the same public mark stream as open
