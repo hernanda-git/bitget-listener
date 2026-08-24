@@ -51,6 +51,7 @@ P_PLACE = "/api/v2/mix/order/place-order"
 P_TPSL = "/api/v2/mix/order/place-tpsl-order"
 P_CANCEL = "/api/v2/mix/order/cancel-order"
 P_OPEN_ORDERS = "/api/v2/mix/order/orders-pending"
+P_PLAN_ORDERS = "/api/v2/mix/order/orders-plan-pending"
 P_FILLS = "/api/v2/mix/order/fills"
 P_POSITIONS = "/api/v2/mix/position/all-position"
 P_ACCOUNTS = "/api/v2/mix/account/accounts"     # PLURAL
@@ -341,11 +342,15 @@ class BitgetAdapter(ExchangeAdapter):
         if order.reduce_only:
             body["reduceOnly"] = "YES"
         else:
-            # preset protective levels attach atomically at entry (VERIFIED names)
-            if order.sl is not None:
-                body["presetStopLossPrice"] = str(self.round_price(spec, order.sl))
-            if order.tp is not None:
-                body["presetStopSurplusPrice"] = str(self.round_price(spec, order.tp))
+            # Live protection is attached once after the fill through
+            # place-tpsl-order. Sending presets here as well creates a second
+            # venue-generated fill_price plan alongside the bot's mark_price
+            # plan. Paper mode keeps the preset fields for fake-backed tests.
+            if self.paper:
+                if order.sl is not None:
+                    body["presetStopLossPrice"] = str(self.round_price(spec, order.sl))
+                if order.tp is not None:
+                    body["presetStopSurplusPrice"] = str(self.round_price(spec, order.tp))
         return body
 
     @staticmethod
@@ -520,7 +525,13 @@ class BitgetAdapter(ExchangeAdapter):
             log.warning("get_protection position read failed for %s: %s", sym, exc)
         plan_sl = plan_tp = None
         try:
-            orders = await self.get_open_orders(instrument)
+            plan_data = await self._signed(
+                "GET", P_PLAN_ORDERS,
+                params={"productType": self.product_type,
+                        "symbol": self.venue_symbol(instrument.symbol),
+                        "planType": "profit_loss"},
+            )
+            orders = list((plan_data or {}).get("entrustedList") or [])
             for o in orders:
                 if str(o.get("symbol") or "").upper() != sym.upper():
                     continue

@@ -432,16 +432,15 @@ async def test_get_protection_merges_plan_orders_over_position(monkeypatch):
     async def fake_positions():
         return [_Pos()]
 
-    async def fake_orders(instrument=None):
-        return [
+    async def fake_plan_read(method, path, params=None, body=None):
+        assert path == "/api/v2/mix/order/orders-plan-pending"
+        return {"entrustedList": [
             {"symbol": "PUMPUSDT", "planType": "loss_plan", "triggerPrice": "0.002882"},
             {"symbol": "PUMPUSDT", "planType": "profit_plan", "triggerPrice": "0.00337"},
-            # a non-protective entry order must be ignored
-            {"symbol": "PUMPUSDT", "orderType": "limit", "triggerPrice": "0.001"},
-        ]
+        ]}
 
     monkeypatch.setattr(ad, "get_positions", fake_positions)
-    monkeypatch.setattr(ad, "get_open_orders", fake_orders)
+    monkeypatch.setattr(ad, "_signed", fake_plan_read)
     sl, tp = await ad.get_protection(Instrument.from_token("PUMPUSDT"))
     assert sl == 0.002882
     assert tp == 0.00337
@@ -460,11 +459,12 @@ async def test_get_protection_returns_none_when_no_protection(monkeypatch):
     async def fake_positions():
         return [_Pos()]
 
-    async def fake_orders(instrument=None):
-        return []
+    async def fake_plan_read(method, path, params=None, body=None):
+        assert path == "/api/v2/mix/order/orders-plan-pending"
+        return {"entrustedList": None}
 
     monkeypatch.setattr(ad, "get_positions", fake_positions)
-    monkeypatch.setattr(ad, "get_open_orders", fake_orders)
+    monkeypatch.setattr(ad, "_signed", fake_plan_read)
     sl, tp = await ad.get_protection(Instrument.from_token("PUMPUSDT"))
     assert sl is None and tp is None
 
