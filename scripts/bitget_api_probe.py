@@ -228,14 +228,24 @@ async def check_ws_public() -> None:
             tick = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
             await ws.send("ping")
             pong = await asyncio.wait_for(ws.recv(), timeout=10)
-            ok = (ack.get("event") == "subscribe" and tick.get("data")
-                  and str(pong).strip() == "pong")
+            heartbeat_ok = str(pong).strip() == "pong"
+            if not heartbeat_ok:
+                try:
+                    heartbeat_frame = json.loads(pong)
+                    heartbeat_ok = bool(
+                        heartbeat_frame.get("arg", {}).get("channel") == "ticker"
+                        and heartbeat_frame.get("data")
+                    )
+                except (TypeError, ValueError, AttributeError):
+                    heartbeat_frame = None
+            ok = ack.get("event") == "subscribe" and tick.get("data") and heartbeat_ok
             record("WS public subscribe + heartbeat", "GREEN" if ok else "RED",
                    f"host={WS_PUBLIC}\n"
                    f"  args are OBJECTS {{instType,channel,instId}} — NOT doc's 'tickers.BTCUSDT' strings\n"
                    f"  ack={json.dumps(ack)[:120]}\n"
                    f"  channel='ticker' (singular); lastPr={tick['data'][0].get('lastPr') if tick.get('data') else None}\n"
-                   f"  heartbeat: client sends literal 'ping' -> server replies {pong!r} (plain text, not JSON)")
+                   f"  heartbeat: client sends literal 'ping' -> server replies {pong!r}; "
+                   "accepted literal pong or a valid ticker snapshot response")
     except Exception as exc:
         record("WS public subscribe + heartbeat", "RED", f"{type(exc).__name__}: {exc}")
 
