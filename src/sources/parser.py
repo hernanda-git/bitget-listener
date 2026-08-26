@@ -29,7 +29,10 @@ _MANAGEMENT = [
     (r"\b(sl to entry|sl be|move sl to be|breakeven|break even)\b", "sl_to_entry"),
     (r"\b(tp1 booked|tp booked|book partial|partial|partials|booking tp1|tp1|"
      r"tp done|tp hit|first tp|booked tp)\b", "partial"),
-    (r"\b(close full|exit full|full close|closed at entry|cutting|full|closed)\b", "full_close"),
+    # Do not treat standalone "full" as a close command: normal prose such as
+    # "full breakdown" must never close the only open position. Keep explicit
+    # close verbs and the established trader shorthand only.
+    (r"\b(close full|exit full|full close|closed at entry|cutting|closed)\b", "full_close"),
     (r"\b(cancel|void|invalidated|no longer valid)\b", "cancel_pending"),
     (r"\btp[123]?\s+[\$]?(\d+(?:\.\d+)?)\b", "tp_modify"),
     (r"\bsl\s+[\$]?(\d+(?:\.\d+)?)\b", "sl_modify"),

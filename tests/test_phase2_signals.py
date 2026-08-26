@@ -60,6 +60,19 @@ def test_management_fast_path_actions(text, action):
     assert rs.management_action == action
 
 
+def test_prose_full_breakdown_is_not_a_close_command():
+    rs = parse_message("Full breakdown for btc and update on our last analysis coming today")
+    assert rs.is_management is False
+    assert rs.management_action is None
+
+
+def test_tp1_here_at_3r_is_partial():
+    rs = parse_message("$fartcoin tp1 here at 3R")
+    assert rs.symbol_usdt == "FARTCOINUSDT"
+    assert rs.is_management is True
+    assert rs.management_action == "partial"
+
+
 def test_management_tp_modify_extracts_price():
     rs = parse_message("tp1 3350")
     assert rs.is_management is True
