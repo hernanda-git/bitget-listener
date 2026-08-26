@@ -81,16 +81,25 @@ class OrderService:
             return {"status": "DUPLICATE_SKIPPED", "reason": "decision already has a live order",
                     "client_order_id": dedup.existing_client_order_id}
 
+        explicit_type = str(signal.raw.get("entry_order_type", "")).upper()
+        if explicit_type not in ("MARKET", "LIMIT"):
+            # Preserve the signal entry exactly. Only choose execution style from
+            # the live mark: below-entry signals may enter at market, while an
+            # entry above/equal to mark must rest as a LIMIT at the signal price.
+            live_mark = mark_price
+            if live_mark is None:
+                live_mark = await self.adapter.get_mark_price(signal.instrument)
+            explicit_type = "MARKET" if float(live_mark) < float(entry) else "LIMIT"
+
         order = OrderRequest(
-            instrument=signal.instrument, side=signal.side, order_type="market",
-            qty=BitgetAdapter.round_qty(spec, qty, entry), price=None,
+            instrument=signal.instrument, side=signal.side,
+            order_type=explicit_type.lower(),
+            qty=BitgetAdapter.round_qty(spec, qty, entry),
+            price=entry if explicit_type == "LIMIT" else None,
             sl=signal.sl, tp=signal.tp, leverage=sized.leverage,
             margin_mode="crossed",
             client_order_id=client_oid, decision_id=decision_id,
         )
-        if signal.raw.get("entry_order_type") == "LIMIT":
-            order.order_type = "limit"
-            order.price = entry
 
         verdict = validate_order(order, spec, price_ref=entry)
         if not verdict:
