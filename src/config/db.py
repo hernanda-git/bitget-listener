@@ -47,7 +47,7 @@ DEFAULT_PARAMS: dict = {
     "risk_profile": "normal",
     "high_risk_min_margin_usd": 3.0,
     "high_risk_min_leverage": 30,
-    "high_risk_major_symbols": ["BTCUSDT", "ETHUSDT"],
+    "high_risk_minimum_margin_exception_usd": 3.0,
 }
 
 

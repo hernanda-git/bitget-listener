@@ -50,10 +50,12 @@ class TradabilityChecker:
     """
 
     def __init__(self, adapter, margin_headroom: float = 0.95,
-                 max_leverage: int = 1, blocklist: set[str] | None = None):
+                 max_leverage: int = 1, blocklist: set[str] | None = None,
+                 high_risk: bool = False):
         self.adapter = adapter
         self.margin_headroom = margin_headroom
         self.max_leverage = max(1, int(max_leverage))
+        self.high_risk = bool(high_risk)
         self.blocklist = {s.upper() for s in (blocklist or set())}
 
     async def check(self, symbol: str) -> Tradability:
@@ -84,7 +86,8 @@ class TradabilityChecker:
             return Tradability(True, sym, "balance unavailable — deferring to sizer",
                                min_notional=min_notional)
 
-        lev = min(self.max_leverage, int(spec.max_leverage or 1) or 1)
+        lev = int(spec.max_leverage or 1) if self.high_risk else min(
+            self.max_leverage, int(spec.max_leverage or 1) or 1)
         # At the configured max leverage, what notional can our available margin
         # actually support? A $5 min-notional position needs $5 notional (or $0.25
         # margin at 20x) — trivially affordable on $8.88. A coin whose min notional

@@ -137,8 +137,8 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
         high_risk=str(cfg.params.get("risk_profile", "normal")).lower() == "high",
         high_risk_min_margin_usd=float(cfg.params.get("high_risk_min_margin_usd", 3.0)),
         high_risk_min_leverage=int(cfg.params.get("high_risk_min_leverage", 30)),
-        high_risk_major_symbols=tuple(str(x).upper() for x in
-                                      cfg.params.get("high_risk_major_symbols", ["BTCUSDT", "ETHUSDT"])),
+        high_risk_minimum_margin_exception_usd=float(cfg.params.get(
+            "high_risk_minimum_margin_exception_usd", 3.0)),
     )
     # Per-signal affordability: a symbol is eligible when its effective min
     # notional is actually affordable against live available margin — not because
@@ -147,7 +147,7 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
     from src.services.tradability import TradabilityChecker
     tradability = TradabilityChecker(
         adapter, margin_headroom=0.95, max_leverage=limits.max_leverage,
-        blocklist=set())
+        blocklist=set(), high_risk=limits.high_risk)
     orch = Orchestrator(source, adapter, gate, ledger, notifier=notifier, stream=stream,
                         shadow=shadow, limits=limits, symbol_map=symbol_map,
                         whitelist=whitelist, rate_limit=rate_limit,

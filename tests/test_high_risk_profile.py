@@ -17,6 +17,16 @@ def test_normal_profile_is_unchanged():
     assert result.notional_usd < 90
 
 
+def test_high_profile_any_large_coin_uses_venue_max_and_minimum_notional():
+    limits = RiskLimits(high_risk=True, max_leverage=30, risk_per_trade_usd=0.01)
+    result = FixedRiskSizer(limits).size_for_signal(
+        150, 1.0, spec("SOLUSDT", max_leverage=100, min_notional=12.0),
+        requested_leverage=10)
+    assert result.leverage == 100
+    assert result.notional_usd >= 12.0
+    assert result.notional_usd < 90.0
+
+
 def test_high_profile_regular_coin_has_30x_and_three_dollar_margin_floor():
     limits = RiskLimits(high_risk=True, max_leverage=30, risk_per_trade_usd=0.01)
     result = FixedRiskSizer(limits).size_for_signal(

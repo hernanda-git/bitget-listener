@@ -96,6 +96,7 @@ class Orchestrator:
         self.orders.limits = self.limits
         if self.tradability is not None:
             self.tradability.max_leverage = max(1, self.limits.max_leverage)
+            self.tradability.high_risk = enabled
         if self.gate.config_store is not None and hasattr(self.gate.config_store, "set_params"):
             self.gate.config_store.set_params({"risk_profile": "high" if enabled else "normal"})
         return "high-risk ON" if enabled else "normal-risk ON"
@@ -1015,7 +1016,7 @@ class Orchestrator:
             "risk_policy": {
                 "min_margin_usd": self.limits.high_risk_min_margin_usd if self.limits.high_risk else None,
                 "min_leverage": self.limits.high_risk_min_leverage if self.limits.high_risk else None,
-                "major_symbols": list(self.limits.high_risk_major_symbols),
+                "minimum_margin_exception_usd": self.limits.high_risk_minimum_margin_exception_usd,
             },
             "gate": self.gate.status(),
             "tg_cmd_conflict": bool(bot_poller.tg_cmd_conflict),

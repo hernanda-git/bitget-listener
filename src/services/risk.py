@@ -32,7 +32,7 @@ class RiskLimits:
     high_risk: bool = False
     high_risk_min_margin_usd: float = 3.0
     high_risk_min_leverage: int = 30
-    high_risk_major_symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
+    high_risk_minimum_margin_exception_usd: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -94,11 +94,12 @@ class FixedRiskSizer(RiskPolicy):
         risk = risk_usd if risk_usd is not None else self.limits.risk_per_trade_usd
         requested = int(requested_leverage or self.limits.max_leverage)
         if self.limits.high_risk:
-            is_major = spec.symbol.upper() in self.limits.high_risk_major_symbols
-            if is_major:
-                # BTC/ETH use the venue's own maximum leverage and effective
-                # minimum notional. This preserves the contract-size floor
-                # without forcing the general $3 margin profile onto majors.
+            # Any symbol whose venue minimum fits the $3 policy at its own
+            # maximum leverage gets the same low-balance treatment. This is
+            # dynamic and covers every large coin, not a hard-coded allowlist.
+            minimum_margin = float(spec.min_notional or 0) / max(1, int(spec.max_leverage or 1))
+            if (float(spec.min_notional or 0) > float(self.limits.min_notional_usd)
+                    and minimum_margin <= self.limits.high_risk_minimum_margin_exception_usd):
                 lev = max(1, int(spec.max_leverage))
             else:
                 lev = max(1, min(max(requested, self.limits.high_risk_min_leverage),
@@ -125,7 +126,9 @@ class FixedRiskSizer(RiskPolicy):
         notional = qty * entry
         minimum_notional = max(spec.min_notional, self.limits.min_notional_usd)
         if self.limits.high_risk:
-            if spec.symbol.upper() in self.limits.high_risk_major_symbols:
+            minimum_margin = float(spec.min_notional or 0) / max(1, int(spec.max_leverage or 1))
+            if (float(spec.min_notional or 0) > float(self.limits.min_notional_usd)
+                    and minimum_margin <= self.limits.high_risk_minimum_margin_exception_usd):
                 minimum_notional = spec.min_notional
             else:
                 minimum_notional = max(minimum_notional,
