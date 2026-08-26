@@ -697,7 +697,10 @@ class BitgetAdapter(ExchangeAdapter):
             if self.paper:
                 log.info("PAPER set_trading_stop %s %s @ %s", instrument.symbol, plan, price)
                 continue
-            qty = str(self.round_qty(spec, size, price)) if size else "0"
+            # Protection is always reduce-only. Never inflate its quantity to
+            # satisfy the opening minimum-notional rule: doing so can exceed
+            # the actual held position and Bitget rejects it with 43023.
+            qty = str(self.round_qty(spec, size, price, reduce_only=True)) if size else "0"
             body = self._build_tpsl_body(spec, instrument.symbol, plan, price,
                                          hold_side, margin_mode, qty,
                                          self.new_client_oid("bgp"))

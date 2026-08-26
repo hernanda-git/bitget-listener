@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import asdict
+from enum import Enum
+import json
 import logging
 import os
 import time
@@ -31,6 +33,11 @@ from src.services.position import PositionManager
 from src.services.risk import FixedRiskSizer, RiskLimits
 
 log = logging.getLogger(__name__)
+
+
+def _jsonable(value):
+    """Convert dataclass payloads containing domain enums before PG JSON writes."""
+    return json.loads(json.dumps(value, default=lambda obj: obj.value if isinstance(obj, Enum) else str(obj)))
 
 
 class Orchestrator:
@@ -205,7 +212,7 @@ class Orchestrator:
     async def handle(self, rs: RawSignal) -> dict:
         """Single entry point for one inbound message."""
         await self._trace(rs, "PARSED", "OK", payload={
-            "raw_signal": asdict(rs), "raw_text": rs.raw_text,
+            "raw_signal": _jsonable(asdict(rs)), "raw_text": rs.raw_text,
             "symbol": rs.symbol_usdt, "side": rs.side, "has_media": bool(rs.has_media),
         })
         if rs.is_management:
@@ -299,7 +306,7 @@ class Orchestrator:
             return {"status": "SKIPPED", "reason": reason}
 
         await self._trace(rs, "DECISION", "ACCEPTED", payload={
-            "signal": asdict(signal), "raw_text": rs.raw_text,
+            "signal": _jsonable(asdict(signal)), "raw_text": rs.raw_text,
             "direction_evidence": (rs.raw or {}).get("direction_evidence", []),
             "model_direction": (rs.raw or {}).get("model_direction", ""),
         })
@@ -320,9 +327,9 @@ class Orchestrator:
                               "status": result.get("status"),
                               "order_id": result.get("order_id"),
                               "client_order_id": result.get("client_order_id"),
-                              "order": asdict(result["order"]) if result.get("order") is not None else None,
-                              "sizing": asdict(result["sizing"]) if result.get("sizing") is not None else None,
-                              "fill": asdict(result["fill"]) if result.get("fill") is not None else None,
+                              "order": _jsonable(asdict(result["order"])) if result.get("order") is not None else None,
+                              "sizing": _jsonable(asdict(result["sizing"])) if result.get("sizing") is not None else None,
+                              "fill": _jsonable(asdict(result["fill"])) if result.get("fill") is not None else None,
                               "fill_price": result.get("fill_price"),
                               "fill_fee": result.get("fill_fee"),
                           })
@@ -334,7 +341,7 @@ class Orchestrator:
                               "trade_id": self.open_trade_ids.get(signal.instrument.symbol),
                               "protection_pending": bool(result.get("protection_pending")),
                               "protection": result.get("protection"),
-                              "position": asdict(self.positions.get(signal.instrument.symbol))
+                              "position": _jsonable(asdict(self.positions.get(signal.instrument.symbol)))
                               if self.positions.get(signal.instrument.symbol) is not None else None,
                           })
         return result
@@ -647,7 +654,7 @@ class Orchestrator:
             if loop is not None:
                 loop.create_task(asyncio.to_thread(
                     recorder, f"position:{position.instrument.symbol}", 0,
-                    "POSITION_OBSERVED", "OK", "", {"position": asdict(position)}))
+                    "POSITION_OBSERVED", "OK", "", {"position": _jsonable(asdict(position))}))
 
     async def on_tick(self, symbol: str, mark: float) -> None:
         # Pending setups are observed from the same public mark stream as open
