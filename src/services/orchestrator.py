@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from enum import Enum
 import json
 import logging
@@ -82,6 +82,23 @@ class Orchestrator:
         self._task: asyncio.Task | None = None
         self._running = False
         self.report_interval_s = float(os.getenv("BITGET_REPORT_INTERVAL_S", "21600"))
+
+    def high_risk_enabled(self) -> bool:
+        return bool(self.limits.high_risk)
+
+    def set_high_risk(self, enabled: bool) -> str:
+        """Switch sizing policy for future entries; never changes open positions."""
+        enabled = bool(enabled)
+        if enabled == self.limits.high_risk:
+            return "high-risk ON" if enabled else "normal-risk ON"
+        self.limits = replace(self.limits, high_risk=enabled)
+        self.sizer.limits = self.limits
+        self.orders.limits = self.limits
+        if self.tradability is not None:
+            self.tradability.max_leverage = max(1, self.limits.max_leverage)
+        if self.gate.config_store is not None and hasattr(self.gate.config_store, "set_params"):
+            self.gate.config_store.set_params({"risk_profile": "high" if enabled else "normal"})
+        return "high-risk ON" if enabled else "normal-risk ON"
 
     async def _trace(self, rs: RawSignal, stage: str, status: str = "OK",
                      reason: str = "", payload: dict | None = None) -> None:
@@ -994,6 +1011,12 @@ class Orchestrator:
         nets = self.ledger.net_pnls()
         return {
             "mode": "PAPER" if self.gate.paper else "LIVE",
+            "risk_profile": "HIGH" if self.limits.high_risk else "NORMAL",
+            "risk_policy": {
+                "min_margin_usd": self.limits.high_risk_min_margin_usd if self.limits.high_risk else None,
+                "min_leverage": self.limits.high_risk_min_leverage if self.limits.high_risk else None,
+                "major_symbols": list(self.limits.high_risk_major_symbols),
+            },
             "gate": self.gate.status(),
             "tg_cmd_conflict": bool(bot_poller.tg_cmd_conflict),
             "tg_cmd_degraded": bool(bot_poller.tg_cmd_degraded()),

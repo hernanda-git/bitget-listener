@@ -129,9 +129,16 @@ async def build_runtime(cfg: BotConfig, store, use_fake_source: bool = False):
         max_position_usd=float(cfg.params.get("max_position_usd", 100.0)),
         max_concurrent=int(cfg.params.get("max_concurrent", 2)),
         max_daily_loss_pct=float(cfg.params.get("max_daily_loss_pct", 30.0)),
-        max_leverage=int(cfg.params.get("max_leverage", 20)),
+        max_leverage=max(int(cfg.params.get("max_leverage", 20)),
+                         int(cfg.params.get("high_risk_min_leverage", 30))
+                         if str(cfg.params.get("risk_profile", "normal")).lower() == "high" else 0),
         min_notional_usd=float(cfg.params.get("min_notional_usd", 5.0)),
         equity_usd=float(os.getenv("EQUITY_USD", "100")),
+        high_risk=str(cfg.params.get("risk_profile", "normal")).lower() == "high",
+        high_risk_min_margin_usd=float(cfg.params.get("high_risk_min_margin_usd", 3.0)),
+        high_risk_min_leverage=int(cfg.params.get("high_risk_min_leverage", 30)),
+        high_risk_major_symbols=tuple(str(x).upper() for x in
+                                      cfg.params.get("high_risk_major_symbols", ["BTCUSDT", "ETHUSDT"])),
     )
     # Per-signal affordability: a symbol is eligible when its effective min
     # notional is actually affordable against live available margin — not because

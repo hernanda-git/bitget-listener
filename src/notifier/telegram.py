@@ -339,12 +339,15 @@ class CommandRouter:
         ("bitget_balance", "", "wallet, margin and equity", False, "Monitor"),
         ("bitget_activity", "[n]", "recent closed trades", False, "Monitor"),
         ("bitget_health", "", "system liveness and safety rails", False, "Monitor"),
+        ("bitget_price", "<SYMBOL>", "live mark price", False, "Monitor"),
+        ("bitget_limit_orders", "", "pending limit orders", False, "Monitor"),
         ("bitget_pairs", "", "pairs flagged weak by the shadow ledger", False, "Monitor"),
         ("bitget_open", "<SYM> <BUY|SELL> <sl> [tp] [usd]",
          "open a position manually", True, "Trade"),
         ("bitget_close", "<SYM|all>", "market-close a position", True, "Trade"),
         ("bitget_sl_to_entry", "<SYM>", "move stop-loss to break-even", True, "Trade"),
         ("bitget_toggle", "", "switch between paper and live", True, "Control"),
+        ("bitget_highrisk", "[on|off]", "toggle high-risk sizing profile", True, "Control"),
         ("bitget_paper", "", "return to paper mode immediately", True, "Control"),
         ("bitget_live", "<token>", "redeem a go-live token", True, "Control"),
         ("bitget_help", "", "show this menu", False, "Monitor"),
@@ -424,8 +427,8 @@ class CommandRouter:
         if action in ("/", "help", "start", "commands", "menu"):
             return self.help_text(self.authorized(sender_id))
 
-        if action in ("status", "positions", "pairs", "health",
-                      "balance", "pnl", "activity"):     # read-only, open
+        if action in ("status", "positions", "pairs", "health", "price",
+                      "limit_orders", "balance", "pnl", "activity"):     # read-only, open
             return await self._read_only("/" + action, args)
 
         if not self.authorized(sender_id):
@@ -438,6 +441,19 @@ class CommandRouter:
             out = str(self.gate.toggle("telegram"))
             self._push_mode(out)
             return fmt.join(fmt.title("Mode change", "🔐"), out)
+        if action == "highrisk":
+            if self.orch is None or not hasattr(self.orch, "set_high_risk"):
+                return fmt.join(fmt.title("Risk profile unavailable", "⚠️"))
+            if args and args[0].lower() not in ("on", "off"):
+                return fmt.join(fmt.title("Invalid risk profile", "⚠️"),
+                                fmt.row("Usage", "/bitget_highrisk [on|off]"))
+            current = bool(self.orch.high_risk_enabled())
+            enabled = (not current) if not args else args[0].lower() == "on"
+            out = self.orch.set_high_risk(enabled)
+            return fmt.join(fmt.title("Risk profile changed", "⚠️" if enabled else "✅"),
+                            fmt.plain_row("Profile", f"<b>{'HIGH' if enabled else 'NORMAL'}</b>"),
+                            fmt.plain_row("Result", out),
+                            fmt.hint("Applies to new entries only. Existing positions are unchanged."))
         if action == "paper":
             out = str(self.gate.to_paper("telegram"))
             self._push_mode(out)
@@ -658,13 +674,61 @@ class CommandRouter:
             with contextlib.suppress(Exception):
                 await self.positions.sync()
 
+        if cmd == "/price":
+            if not args:
+                return fmt.join(fmt.title("Price", "💹"),
+                                fmt.row("Usage", "/bitget_price <SYMBOL>"))
+            symbol = args[0].upper()
+            inst = Instrument.from_token(symbol[:-4] if symbol.endswith("USDT") else symbol)
+            if self._adapter is None:
+                return fmt.join(fmt.title("Price unavailable", "⚠️"),
+                                fmt.hint("No exchange adapter is wired."))
+            try:
+                mark = await self._adapter.get_mark_price(inst)
+            except Exception as exc:
+                return fmt.join(fmt.title("Price unavailable", "⚠️"),
+                                fmt.row("Symbol", inst.symbol),
+                                fmt.hint(f"{type(exc).__name__}: {exc}"))
+            return fmt.join(fmt.title("Live price", "💹"), fmt.rule(),
+                            fmt.lines(fmt.row("Symbol", inst.symbol),
+                                      fmt.row("Mark", fmt.price(mark))))
+
+        if cmd == "/limit_orders":
+            if self._adapter is None:
+                return fmt.join(fmt.title("Orders unavailable", "⚠️"),
+                                fmt.hint("No exchange adapter is wired."))
+            try:
+                raw_orders = await self._adapter.get_open_orders()
+            except Exception as exc:
+                return fmt.join(fmt.title("Orders unavailable", "⚠️"),
+                                fmt.hint(f"{type(exc).__name__}: {exc}"))
+            orders = [o for o in raw_orders
+                      if str(o.get("orderType", o.get("ordType", ""))).lower() == "limit"
+                      and not getattr(self._adapter, "is_protective", lambda _: False)(o)]
+            if not orders:
+                return fmt.join(fmt.title("No pending limit orders", "📭"),
+                                fmt.hint("The exchange has no working non-protective LIMIT orders."))
+            cards = []
+            for o in orders:
+                cards.append(fmt.lines(
+                    fmt.row("Symbol", o.get("symbol", "?")),
+                    fmt.row("Side", o.get("side", "?")),
+                    fmt.row("Price", fmt.price(o.get("price", o.get("px")))),
+                    fmt.row("Size", fmt.qty(o.get("size", o.get("sz", o.get("quantity", 0))))),
+                    fmt.row("Order ID", o.get("orderId", o.get("clientOid", "?")))))
+            return fmt.join(fmt.title(f"Pending limit orders · {len(cards)}", "📋"),
+                            *cards)
+
         if cmd == "/status":
             st = self.gate.status()
             live = st["mode"] == "LIVE"
             head = fmt.title("Status", "🟢" if live else "🧪")
             mode_row = fmt.plain_row("Mode", f"<b>{st['mode']}</b>")
             n_open = len(self.positions.positions)
-            body = [mode_row, fmt.plain_row("Open positions", f"<b>{n_open}</b>")]
+            risk_enabled = bool(self.orch and getattr(self.orch, "high_risk_enabled", lambda: False)())
+            body = [mode_row, fmt.plain_row(
+                "Risk profile", f"<b>{'HIGH' if risk_enabled else 'NORMAL'}</b>"),
+                    fmt.plain_row("Open positions", f"<b>{n_open}</b>")]
             if self.orch is not None:
                 body.append(fmt.plain_row(
                     "Today", f"<b>{fmt.money(self.orch.daily_realized, 4)} USDT</b>"))

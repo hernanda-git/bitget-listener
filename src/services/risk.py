@@ -29,6 +29,10 @@ class RiskLimits:
     cooldown_s: int = 30
     whitelist_only: bool = True
     equity_usd: float = 100.0   # denominator for the daily-loss kill switch
+    high_risk: bool = False
+    high_risk_min_margin_usd: float = 3.0
+    high_risk_min_leverage: int = 30
+    high_risk_major_symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
 
 
 @dataclass(frozen=True)
@@ -88,8 +92,19 @@ class FixedRiskSizer(RiskPolicy):
         if entry <= 0:
             return SizeResult(0, 1, 0, 0, 0, "invalid entry price")
         risk = risk_usd if risk_usd is not None else self.limits.risk_per_trade_usd
-        lev = max(1, min(int(requested_leverage or self.limits.max_leverage),
-                         self.limits.max_leverage, spec.max_leverage))
+        requested = int(requested_leverage or self.limits.max_leverage)
+        if self.limits.high_risk:
+            is_major = spec.symbol.upper() in self.limits.high_risk_major_symbols
+            if is_major:
+                # BTC/ETH use the venue's own maximum leverage and effective
+                # minimum notional. This preserves the contract-size floor
+                # without forcing the general $3 margin profile onto majors.
+                lev = max(1, int(spec.max_leverage))
+            else:
+                lev = max(1, min(max(requested, self.limits.high_risk_min_leverage),
+                                 self.limits.max_leverage, spec.max_leverage))
+        else:
+            lev = max(1, min(requested, self.limits.max_leverage, spec.max_leverage))
         fee_rate = spec.taker_fee * 2  # assume taker in and taker out (conservative)
 
         if sl is None or sl <= 0 or abs(entry - sl) <= 0:
@@ -108,8 +123,15 @@ class FixedRiskSizer(RiskPolicy):
                 reason = "clamped to max_position_usd"
 
         notional = qty * entry
-        if notional < max(spec.min_notional, self.limits.min_notional_usd):
-            need = max(spec.min_notional, self.limits.min_notional_usd)
+        minimum_notional = max(spec.min_notional, self.limits.min_notional_usd)
+        if self.limits.high_risk:
+            if spec.symbol.upper() in self.limits.high_risk_major_symbols:
+                minimum_notional = spec.min_notional
+            else:
+                minimum_notional = max(minimum_notional,
+                                       self.limits.high_risk_min_margin_usd * lev)
+        if notional < minimum_notional:
+            need = minimum_notional
             if need > self.limits.max_position_usd:
                 return SizeResult(0, lev, 0, 0, 0,
                                   f"min notional {need} exceeds max_position_usd")

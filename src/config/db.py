@@ -44,6 +44,10 @@ DEFAULT_PARAMS: dict = {
     "cooldown_s": 30,
     "whitelist_only": True,
     "product_type": "SUSDT-FUTURES",
+    "risk_profile": "normal",
+    "high_risk_min_margin_usd": 3.0,
+    "high_risk_min_leverage": 30,
+    "high_risk_major_symbols": ["BTCUSDT", "ETHUSDT"],
 }
 
 
@@ -145,3 +149,8 @@ class PostgresConfigStore:
 
     def get_paper(self) -> bool:
         return self.load().paper
+
+    def set_params(self, params: dict) -> None:
+        cfg = self.load()
+        cfg.params.update(params)
+        self.upsert(cfg)
