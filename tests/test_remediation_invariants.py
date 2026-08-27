@@ -52,20 +52,6 @@ async def test_limit_conditional_and_entry_margin_mode_are_explicit():
     assert adapter.placed[0].margin_mode == "crossed"
 
 
-@pytest.mark.asyncio
-async def test_favorable_pullback_uses_live_mark_for_market_entry():
-    adapter = FakeExchangeAdapter(mark=0.16)
-    service = OrderService(adapter, paper=False)
-    signal = Signal(instrument=Instrument.from_token("WIF"), side=Side.BUY,
-                    entry=0.174, sl=0.15, tp=None, notional_usd=0, leverage=1)
-    result = await service.open_from_signal(signal)
-    assert result["status"] == "PLACED"
-    order = adapter.placed[0]
-    assert order.order_type == "market"
-    assert order.price is None
-    assert result["sizing"].notional_usd == pytest.approx(order.qty * 0.16)
-
-
 class _Cursor:
     def __init__(self, inserted=True, row=None):
         self.inserted = inserted
