@@ -59,7 +59,11 @@ class OrderService:
             return {"status": "REJECTED", "reason": "SL is mandatory — refusing entry"}
 
         spec = await self._spec(signal.instrument)
-        entry = signal.entry or mark_price or await self.adapter.get_mark_price(signal.instrument)
+        live_mark = mark_price or await self.adapter.get_mark_price(signal.instrument)
+        signal_entry = signal.entry or live_mark
+        # Favorable pullback: market-enter from the live mark. Otherwise preserve
+        # the trader's signal entry as the resting LIMIT price.
+        entry = live_mark if signal.entry and live_mark < signal.entry else signal_entry
         if not entry or entry <= 0:
             return {"status": "REJECTED", "reason": "no usable entry/mark price"}
 
@@ -86,10 +90,7 @@ class OrderService:
             # Preserve the signal entry exactly. Only choose execution style from
             # the live mark: below-entry signals may enter at market, while an
             # entry above/equal to mark must rest as a LIMIT at the signal price.
-            live_mark = mark_price
-            if live_mark is None:
-                live_mark = await self.adapter.get_mark_price(signal.instrument)
-            explicit_type = "MARKET" if float(live_mark) < float(entry) else "LIMIT"
+            explicit_type = "MARKET" if signal.entry and float(live_mark) < float(signal.entry) else "LIMIT"
 
         order = OrderRequest(
             instrument=signal.instrument, side=signal.side,

@@ -44,3 +44,14 @@ def test_high_profile_btc_uses_venue_max_and_effective_minimum_notional():
     assert result.leverage == 125
     assert result.notional_usd >= 8.0
     assert result.notional_usd < 90.0
+
+
+def test_high_profile_inj_minimum_is_not_blocked_by_normal_position_cap():
+    limits = RiskLimits(high_risk=True, max_position_usd=10.0,
+                        max_leverage=30, risk_per_trade_usd=0.01)
+    result = FixedRiskSizer(limits).size_for_signal(
+        5.5, 5.345, spec("INJUSDT", max_leverage=30, min_notional=5.0),
+        requested_leverage=10)
+    assert result.ok
+    assert result.leverage == 30
+    assert result.notional_usd == 90.0

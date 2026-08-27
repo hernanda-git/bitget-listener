@@ -108,9 +108,27 @@ class FixedRiskSizer(RiskPolicy):
             lev = max(1, min(requested, self.limits.max_leverage, spec.max_leverage))
         fee_rate = spec.taker_fee * 2  # assume taker in and taker out (conservative)
 
+        minimum_notional = max(spec.min_notional, self.limits.min_notional_usd)
+        if self.limits.high_risk:
+            minimum_margin = float(spec.min_notional or 0) / max(1, int(spec.max_leverage or 1))
+            low_balance_exception = (
+                float(spec.min_notional or 0) > float(self.limits.min_notional_usd)
+                and minimum_margin <= self.limits.high_risk_minimum_margin_exception_usd
+            )
+            if low_balance_exception:
+                minimum_notional = spec.min_notional
+            else:
+                minimum_notional = max(minimum_notional,
+                                       self.limits.high_risk_min_margin_usd * lev)
+            # The normal cap must not invalidate the high-risk minimum. The
+            # live balance/tradability gate remains responsible for affordability.
+            effective_max_position = max(self.limits.max_position_usd, minimum_notional)
+        else:
+            effective_max_position = self.limits.max_position_usd
+
         if sl is None or sl <= 0 or abs(entry - sl) <= 0:
             notional = min(self.limits.risk_per_trade_usd * lev,
-                           self.limits.max_position_usd)
+                           effective_max_position)
             qty = notional / entry
             reason = "no SL distance — fell back to notional cap"
         else:
@@ -118,26 +136,14 @@ class FixedRiskSizer(RiskPolicy):
             qty = risk / per_unit_loss
             notional = qty * entry
             reason = ""
-            if notional > self.limits.max_position_usd:
-                qty = self.limits.max_position_usd / entry
+            if notional > effective_max_position:
+                qty = effective_max_position / entry
                 notional = qty * entry
                 reason = "clamped to max_position_usd"
 
         notional = qty * entry
-        minimum_notional = max(spec.min_notional, self.limits.min_notional_usd)
-        if self.limits.high_risk:
-            minimum_margin = float(spec.min_notional or 0) / max(1, int(spec.max_leverage or 1))
-            if (float(spec.min_notional or 0) > float(self.limits.min_notional_usd)
-                    and minimum_margin <= self.limits.high_risk_minimum_margin_exception_usd):
-                minimum_notional = spec.min_notional
-            else:
-                minimum_notional = max(minimum_notional,
-                                       self.limits.high_risk_min_margin_usd * lev)
         if notional < minimum_notional:
             need = minimum_notional
-            if need > self.limits.max_position_usd:
-                return SizeResult(0, lev, 0, 0, 0,
-                                  f"min notional {need} exceeds max_position_usd")
             qty = need / entry
             notional = qty * entry
             reason = (reason + "; " if reason else "") + "raised to min notional"
